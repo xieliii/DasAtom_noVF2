@@ -413,28 +413,50 @@ def compute_fidelity(parallel_gates, all_movements, num_q, gate_num, para=None):
     return t_idle, Fidelity, move_fidelity, t_total, num_trans, num_move, all_move_dis
 
 def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initial_mapping=None):
-    embeddings = []
-    begin_index = 0
-    extend_position = []
-    if initial_mapping:
-        embeddings.append(initial_mapping)
-        begin_index = 1
-    for i in range(begin_index, len(partition_gates)):
-        tmp_graph = nx.Graph()
-        tmp_graph.add_edges_from(partition_gates[i])
-        if not rx_is_subgraph_iso(coupling_graph, tmp_graph):
-            coupling_graph = extend_graph(coupling_graph, arch_size, Rb)
-            extend_position.append(i)
-        next_embedding = get_rx_one_mapping(tmp_graph, coupling_graph)
-        next_embedding = map2list(next_embedding,num_q)
+    """
+    纯血版嵌入生成：MCTS 开局 + 力导向续航，彻底摒弃 VF2。
+
+    Args:
+        partition_gates: 分区门列表
+        coupling_graph: 物理耦合图
+        num_q: 量子比特数
+        arch_size: 网格尺寸（保留接口，不再用于扩图）
+        Rb: 相互作用半径
+        initial_mapping: MCTS 提供的第 0 层映射（必须提供）
+
+    Returns:
+        (embeddings, []) — 第二个值始终为空列表（无扩图）
+    """
+    from analytical_placer import force_directed_mapping
+
+    if initial_mapping is None:
+        raise ValueError("纯血模式下，必须由 MCTS 提供 initial_mapping 开局！")
+
+    embeddings = [initial_mapping]
+
+    # 从 Layer 1 开始，全部使用力导向，不检查合法性，不扩图，不退回 VF2
+    for i in range(1, len(partition_gates)):
+        all_nodes = list(coupling_graph.nodes())
+        prev = embeddings[-1]
+
+        # 力导向一步到位：弹簧求解 + 贪心吸附
+        next_embedding = force_directed_mapping(
+            partition_gates[i],
+            prev,
+            all_nodes,
+            Rb,
+            num_q
+        )
         embeddings.append(next_embedding)
 
-    for i in range(begin_index, len(embeddings)):
+    # 补全未映射的比特（理论上贪心吸附已保证无 -1，此处为安全兜底）
+    for i in range(1, len(embeddings)):
         indices = [index for index, value in enumerate(embeddings[i]) if value == -1]
         if indices:
             embeddings[i] = complete_mapping(i, embeddings, indices, coupling_graph)
 
-    return embeddings, extend_position
+    # 没有扩图，extend_position 永远为空
+    return embeddings, []
 
 def qasm_to_map(filename):
 

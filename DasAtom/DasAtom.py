@@ -5,6 +5,7 @@ from openpyxl import Workbook
 import warnings
 from Enola.route import QuantumRouter
 from DasAtom_fun import *
+from mcts_mapper import mcts_initial_mapping
 import argparse
 
 class SingleFileProcessor:
@@ -38,7 +39,8 @@ class SingleFileProcessor:
         read_embeddings: bool,
         save_partitions_and_embeddings: bool,
         save_circuit_results: bool,
-        save_benchmark_results: bool
+        save_benchmark_results: bool,
+        engine: str = 'dual'
     ):
         """
         Initialize the processor with file-specific and benchmark-wide parameters.
@@ -81,6 +83,7 @@ class SingleFileProcessor:
         self.save_partitions_and_embeddings = save_partitions_and_embeddings
         self.save_circuit_results = save_circuit_results
         self.save_benchmark_results = save_benchmark_results
+        self.engine = engine
 
         # Used to store logs for the final XLSX per file
         # 用于存储每个文件最终 XLSX 的日志
@@ -134,7 +137,8 @@ class SingleFileProcessor:
             partitioned_gates,
             coupling_graph,
             num_qubits,
-            grid_size
+            grid_size,
+            dag_object
         )
 
         # 6) Generate parallel gates and all movement operations
@@ -179,7 +183,7 @@ class SingleFileProcessor:
             f'{self.qasm_filename}_rb{self.interaction_radius:.3g}.xlsx'
         )
         for item in self.file_process_log:
-            ws.append(item)
+            ws.append([str(v) if not isinstance(v, (int, float, str)) else v for v in item])
         if self.save_circuit_results:
             wb.save(save_file_name)
 
@@ -277,13 +281,15 @@ class SingleFileProcessor:
         partitioned_gates,
         coupling_graph,
         num_qubits,
-        grid_size
+        grid_size,
+        dag_object
     ):
         """
         Retrieve or compute embeddings for each partition. If read_embeddings
-        is True, read from JSON. Otherwise, compute embeddings and optionally save.
+        is True, read from JSON. Otherwise, use MCTS for the initial mapping
+        and compute remaining embeddings.
         检索或计算每个分区的嵌入。如果 read_embeddings 为 True，则从 JSON 读取。
-        否则，计算嵌入并可选择保存。
+        否则，使用 MCTS 生成初始映射，再计算后续嵌入。
 
         :param filename: QASM file name (string).
         :param filename: QASM 文件名（字符串）。
@@ -295,6 +301,8 @@ class SingleFileProcessor:
         :param num_qubits: 电路中的量子比特数。
         :param grid_size: Current grid dimension.
         :param grid_size: 当前网格尺寸。
+        :param dag_object: DAG representation of the circuit (needed by MCTS).
+        :param dag_object: 电路的 DAG 表示（MCTS 需要）。
         :return: (embeddings, potentially updated grid_size)
         :return: (嵌入, 可能更新后的网格尺寸)
         """
@@ -306,12 +314,43 @@ class SingleFileProcessor:
             return embeddings, grid_size
         else:
             start_embed_time = time.time()
+            init_map_list = None
+
+            if self.engine == 'dual':
+                # --- MCTS: 为第 0 层分区生成最优初始映射 ---
+                # 自适应迭代次数：大幅降低基数避免小电路“杀鸡用牛刀”，大电路呈二次方增长保证质量
+                adaptive_iterations = int(max(100, (num_qubits ** 2) * 10))
+                print(f"  [MCTS] Searching for optimal initial mapping for {filename}...")
+                print(f"  [MCTS] Adaptive iterations: {adaptive_iterations} (qubits={num_qubits})")
+                mcts_start = time.time()
+                mcts_dict = mcts_initial_mapping(
+                    dag_object,
+                    coupling_graph,
+                    grid_size,
+                    interaction_radius=self.interaction_radius,
+                    max_iterations=adaptive_iterations
+                )
+                mcts_time = time.time() - mcts_start
+                print(f"  [MCTS] Done in {mcts_time:.2f}s, mapped {len(mcts_dict)} qubits")
+                self.file_process_log.append(["MCTS search time", mcts_time])
+
+                # 格式转换：MCTS 字典 {logic_qubit: (x,y)} -> 列表格式
+                init_map_list = [-1] * num_qubits
+                for q, pos in mcts_dict.items():
+                    if q < num_qubits:
+                        init_map_list[q] = pos
+            else:
+                # --- Baseline 模式：由 DasAtom_Origin 处理，此处不应到达 ---
+                print(f"  [Baseline] Using pure VF2 for {filename}")
+                self.file_process_log.append(["MCTS search time", 0])
+
             embeddings, extended_positions = get_embeddings(
                 partitioned_gates,
                 coupling_graph,
                 num_qubits,
                 grid_size,
-                self.interaction_radius
+                self.interaction_radius,
+                initial_mapping=init_map_list
             )
             self.file_process_log.append(["Embedding computation time", time.time() - start_embed_time])
 
@@ -420,7 +459,8 @@ class DasAtom:
         read_embeddings: bool = False,
         save_partitions_and_embeddings: bool = True,
         save_circuit_results: bool = True,
-        save_benchmark_results: bool = True
+        save_benchmark_results: bool = True,
+        engine: str = 'dual'
     ):
         """
         Initialize the multi-file processor with user-provided settings.
@@ -442,17 +482,21 @@ class DasAtom:
         :param save_circuit_results: 如果为 True，保存每个电路的 XLSX 日志。
         :param save_benchmark_results: If True, save a master XLSX for all circuits.
         :param save_benchmark_results: 如果为 True，为所有电路保存主 XLSX。
+        :param engine: 'dual' (MCTS + force-directed) or 'baseline' (pure VF2).
+        :param engine: 'dual'（MCTS + 力导向）或 'baseline'（纯 VF2）。
         """
         self.benchmark_name = benchmark_name
         self.interaction_radius = interaction_radius
         self.extended_radius = 2 * self.interaction_radius
+        self.engine = engine
 
         assert os.path.exists(circuit_folder), f"Directory not found: {circuit_folder}"
         self.circuit_folder = circuit_folder
 
-        # Default results folder: 'res/{benchmark_name}'
+        # Default results folder: 'res/{engine}_benchmark'
+        # 按 engine 自动分离输出目录，防止结果覆盖
         if results_folder is None:
-            results_folder = f"res/{self.benchmark_name}"
+            results_folder = f"res/{self.engine}_benchmark"
         if os.path.exists(results_folder):
             warnings.warn(
                 f"The results for '{self.benchmark_name}' may be overwritten in: {results_folder}. "
@@ -578,7 +622,8 @@ class DasAtom:
                 read_embeddings=self.read_embeddings,
                 save_partitions_and_embeddings=self.save_partitions_and_embeddings,
                 save_circuit_results=self.save_circuit_results,
-                save_benchmark_results=self.save_benchmark_results
+                save_benchmark_results=self.save_benchmark_results,
+                engine=self.engine
             )
 
             # Returns one row of aggregated stats
@@ -611,7 +656,9 @@ if __name__ == "__main__":
     parser.add_argument("benchmark_name", type=str, help="Name of the benchmark.")
     parser.add_argument("circuit_folder", type=str, help="Path to the folder containing .qasm files.")
     parser.add_argument("--interaction_radius", type=int, default= 2, help="Interaction radius (default=2).")
-    parser.add_argument("--results_folder", type=str, help="Folder where results are stored (default: res/{benchmark_name}).")
+    parser.add_argument("--engine", type=str, choices=['baseline', 'dual'], default='dual',
+                        help="Engine mode: 'baseline' (pure VF2) or 'dual' (MCTS + force-directed). Default: dual.")
+    parser.add_argument("--results_folder", type=str, help="Folder where results are stored (default: res/{engine}_benchmark).")
     parser.add_argument("--read_embeddings", action="store_true", default=False, help="Read precomputed embeddings/partitions.")
     parser.add_argument("--padused", type=bool, default=False, help="Whether to use a specialized embedding tool (not used in code).")
     parser.add_argument("--save_embeddings", action="store_true", default=True, help="Save partition/embedding JSONs (default=True).")
@@ -631,6 +678,7 @@ if __name__ == "__main__":
         read_embeddings=args.read_embeddings,
         save_partitions_and_embeddings=args.save_embeddings,
         save_circuit_results=args.save_circuit_results,
-        save_benchmark_results=args.save_benchmark_results
+        save_benchmark_results=args.save_benchmark_results,
+        engine=args.engine
     )
     das_atom.process_all_files()
