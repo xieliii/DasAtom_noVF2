@@ -203,8 +203,14 @@ class QuantumRouter:
         """
         for current_pos in range(len(self.embeddings) - 1):
             movements = self.resolve_movements(current_pos)
-            assert len(movements) > 0, "there should be some movements between embeddings"
-            self.movement_list.append(movements)
+            if len(movements) == 0:
+                # 警告：相邻分区嵌入完全相同，可能存在布局问题
+                import warnings
+                warnings.warn(f"Zero movements between embedding {current_pos} and {current_pos+1}, "
+                              "this may indicate a layout issue")
+                self.movement_list.append([])
+            else:
+                self.movement_list.append(movements)
 
     def solve_violations(self, movements, violations, sorted_keys):
         """

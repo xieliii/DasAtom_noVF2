@@ -247,15 +247,6 @@ class SingleFileProcessor:
         otherwise partition the circuit's DAG and optionally save to JSON.
         如果 read_embeddings 为 True，则从 JSON 检索预计算的分区，
         否则对电路 DAG 进行分区并可选择保存到 JSON。
-
-        :param filename: Name of the QASM file (without path).
-        :param filename: QASM 文件名（不含路径）。
-        :param coupling_graph: Graph of qubit couplings.
-        :param coupling_graph: 量子比特耦合图。
-        :param dag_object: DAG representation of the circuit.
-        :param dag_object: 电路的 DAG 表示。
-        :return: A list of partitioned gates.
-        :return: 分区门列表。
         """
         if self.read_embeddings:
             return read_data(
@@ -264,7 +255,20 @@ class SingleFileProcessor:
             )
         else:
             start_partition_time = time.time()
-            partitioned_gates = partition_from_DAG(dag_object, coupling_graph)
+            if self.engine == 'noVF2':
+                # noVF2 引擎：容量+度数贪心合并，不用 VF2
+                grid_capacity = len(list(coupling_graph.nodes()))
+                partitioned_gates = layer_only_partition(dag_object, grid_capacity, coupling_graph)
+                self.file_process_log.append(["Partitioning method", "capacity_merge (no VF2)"])
+            elif self.engine == 'dual':
+                # Dual 引擎：快速贪心分层，用启发式替代 VF2
+                grid_capacity = len(list(coupling_graph.nodes()))
+                partitioned_gates = fast_partition(dag_object, grid_capacity, coupling_graph)
+                self.file_process_log.append(["Partitioning method", "fast_partition (heuristic merge)"])
+            else:
+                # Baseline 引擎：保留原版的 VF2 分区
+                partitioned_gates = partition_from_DAG(dag_object, coupling_graph)
+                self.file_process_log.append(["Partitioning method", "VF2 partition"])
             self.file_process_log.append(["Partitioning time", time.time() - start_partition_time])
 
             if self.save_partitions_and_embeddings:
@@ -316,7 +320,7 @@ class SingleFileProcessor:
             start_embed_time = time.time()
             init_map_list = None
 
-            if self.engine == 'dual':
+            if self.engine in ('dual', 'noVF2'):
                 # --- MCTS: 为第 0 层分区生成最优初始映射 ---
                 # 自适应迭代次数：大幅降低基数避免小电路“杀鸡用牛刀”，大电路呈二次方增长保证质量
                 adaptive_iterations = int(max(100, (num_qubits ** 2) * 10))
@@ -656,8 +660,8 @@ if __name__ == "__main__":
     parser.add_argument("benchmark_name", type=str, help="Name of the benchmark.")
     parser.add_argument("circuit_folder", type=str, help="Path to the folder containing .qasm files.")
     parser.add_argument("--interaction_radius", type=int, default= 2, help="Interaction radius (default=2).")
-    parser.add_argument("--engine", type=str, choices=['baseline', 'dual'], default='dual',
-                        help="Engine mode: 'baseline' (pure VF2) or 'dual' (MCTS + force-directed). Default: dual.")
+    parser.add_argument("--engine", type=str, choices=['baseline', 'dual', 'noVF2'], default='dual',
+                        help="Engine mode: 'baseline' (pure VF2), 'dual' (MCTS + force-directed), or 'noVF2' (raw DAG layers + MCTS + force-directed). Default: dual.")
     parser.add_argument("--results_folder", type=str, help="Folder where results are stored (default: res/{engine}_benchmark).")
     parser.add_argument("--read_embeddings", action="store_true", default=False, help="Read precomputed embeddings/partitions.")
     parser.add_argument("--padused", type=bool, default=False, help="Whether to use a specialized embedding tool (not used in code).")

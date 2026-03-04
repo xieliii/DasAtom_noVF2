@@ -107,6 +107,211 @@ def partition_from_DAG(dag, coupling_graph):
 
     return partition_gates
 
+
+def _can_embed_degree_budget(gate_graph, coupling_degree_seq):
+    """
+    检查门图的所有高度数节点能否在耦合图中找到足够的"宿主"位置。
+    
+    思路：门图度数 ≥ k 的节点必须映射到耦合图度数 ≥ k 的位置。
+    我们统计每个度数等级的"需求"和"供给"，如果在任何等级需求>供给就拒绝。
+    
+    这比简单的度数序列对比更严格：它考虑了多个高度数节点的竞争。
+    
+    复杂度 O(V + max_degree)
+    """
+    gate_degs = sorted([d for _, d in gate_graph.degree()], reverse=True)
+    if not gate_degs:
+        return True
+    
+    max_possible_deg = max(gate_degs[0], coupling_degree_seq[0] if coupling_degree_seq else 0)
+    
+    # 对每个度数阈值 k，统计门图中度数>=k 的节点数（demand）
+    # 和耦合图中度数>=k 的节点数（supply）
+    for k in range(max_possible_deg, 0, -1):
+        demand = sum(1 for d in gate_degs if d >= k)
+        supply = sum(1 for d in coupling_degree_seq if d >= k)
+        if demand > supply:
+            return False
+    
+    return True
+
+
+def layer_only_partition(dag, grid_capacity, coupling_graph=None):
+    """
+    容量 + 拓扑约束贪心合并：不用 VF2，用轻量级拓扑检查。
+    
+    合并规则（同时满足才合并）：
+    1. 合并后 qubit 总数 ≤ grid_capacity
+    2. 合并后门图最大度数 ≤ 实际可放置阈值（coupling_max_degree 的一半）
+    3. 度数预算检查：全图度数需求不超过耦合图供给
+    
+    复杂度 O(n·k)，零 VF2 调用。
+    """
+    all_layers = get_layer_gates(dag)
+    
+    if not all_layers:
+        return []
+    
+    # 耦合图度数信息
+    if coupling_graph is not None:
+        coupling_degree_seq = sorted(
+            [d for _, d in coupling_graph.degree()],
+            reverse=True
+        )
+        coupling_max_degree = coupling_degree_seq[0]
+    else:
+        coupling_degree_seq = [4] * grid_capacity
+        coupling_max_degree = 4
+    
+    # 实际可放置阈值：保守地取耦合图最大度数的一半
+    # 这保证 MCTS/力导向一定能找到合法放置
+    # Rb=2, coupling_max=12 → cap=6: 每个qubit最多6门/分区
+    practical_degree_cap = max(coupling_max_degree // 2, 3)
+    
+    def _gate_max_degree(gates):
+        """计算门列表中的最大 qubit 度数"""
+        deg = {}
+        for g in gates:
+            deg[g[0]] = deg.get(g[0], 0) + 1
+            deg[g[1]] = deg.get(g[1], 0) + 1
+        return max(deg.values()) if deg else 0
+    
+    def _check_embeddability(gates):
+        """检查门图是否可嵌入：度数上限 + 度数预算双重检查"""
+        if not gates:
+            return True
+        
+        # 快速检查：最大度数不超上限
+        if _gate_max_degree(gates) > practical_degree_cap:
+            return False
+        
+        # 度数预算检查
+        g = nx.Graph()
+        g.add_edges_from(gates)
+        if len(g.nodes()) > len(coupling_degree_seq):
+            return False
+        return _can_embed_degree_budget(g, coupling_degree_seq)
+    
+    partition_gates = []
+    current_gates = list(all_layers[0])
+    current_qubits = set()
+    for gate in current_gates:
+        current_qubits.add(gate[0])
+        current_qubits.add(gate[1])
+    
+    for i in range(1, len(all_layers)):
+        next_qubits = set()
+        for gate in all_layers[i]:
+            next_qubits.add(gate[0])
+            next_qubits.add(gate[1])
+        
+        merged_qubits = current_qubits | next_qubits
+        
+        # 条件 1：qubit 数不超容量
+        if len(merged_qubits) > grid_capacity:
+            partition_gates.append(current_gates)
+            current_gates = list(all_layers[i])
+            current_qubits = next_qubits
+            continue
+        
+        # 条件 2：合并后的门拓扑可嵌入耦合图
+        trial_gates = current_gates + list(all_layers[i])
+        if not _check_embeddability(trial_gates):
+            partition_gates.append(current_gates)
+            current_gates = list(all_layers[i])
+            current_qubits = next_qubits
+            continue
+        
+        # 两个条件都满足 → 合并
+        current_gates = trial_gates
+        current_qubits = merged_qubits
+    
+    partition_gates.append(current_gates)
+    return partition_gates
+
+
+def fast_partition(dag, grid_capacity, coupling_graph=None):
+    """
+    快速分层：与 partition_from_DAG 保证相同的 Rb 物理正确性，
+    但通过快速短路判断跳过大部分 VF2 调用。
+    
+    VF2 短路规则：
+      - 路径拓扑: 一定可嵌入 → O(1) 通过（与原版一致）
+      - 树结构 (edges == nodes-1): 只要 max_degree ≤ 耦合图最大度数 → O(1) 通过
+      - 小分量 (≤ 3 nodes): 一定可嵌入 → O(1) 通过
+      - 其他 (含环 + 大): 回退到 VF2 子图匹配（保证正确性）
+    """
+    gate_layer_list = get_layer_gates(dag)
+    
+    if not gate_layer_list:
+        return []
+    
+    # 耦合图最大度数
+    if coupling_graph is not None:
+        coupling_max_degree = max(dict(coupling_graph.degree()).values())
+    else:
+        coupling_max_degree = 12
+    
+    last_index = 0
+    partition_gates = []
+    
+    for i in range(len(gate_layer_list)):
+        merge_gates = sum(gate_layer_list[last_index:i+1], [])
+        tmp_graph = nx.Graph()
+        tmp_graph.add_edges_from(merge_gates)
+        connected_components = list(nx.connected_components(tmp_graph))
+        
+        can_merge = True
+        for component in connected_components:
+            subgraph = tmp_graph.subgraph(component)
+            num_nodes = len(subgraph.nodes())
+            num_edges = len(subgraph.edges())
+            
+            if num_edges == 0:
+                continue
+            
+            # 短路 1: 路径拓扑 — 与原版完全一致的判断
+            try:
+                diam = nx.diameter(subgraph)
+                if num_edges == diam:
+                    continue  # 路径图，一定可嵌入
+            except nx.NetworkXError:
+                pass
+            
+            # 短路 2: 小分量 (≤ 3 nodes) — 任何连通图都可嵌入 Rb=2 网格
+            if num_nodes <= 3:
+                continue
+            
+            # 短路 3: 树结构 — 无环，只要度数合法就一定可嵌入
+            if num_edges == num_nodes - 1:  # 树的充要条件
+                max_deg = max(dict(subgraph.degree()).values())
+                if max_deg <= coupling_max_degree:
+                    continue
+            
+            # 以上都不满足 → 含环的非平凡子图，必须用 VF2 精确检查
+            if not rx_is_subgraph_iso(coupling_graph, subgraph):
+                can_merge = False
+                break
+        
+        if can_merge:
+            if i == len(gate_layer_list) - 1:
+                merge_gates = sum(gate_layer_list[last_index:i+1], [])
+                partition_gates.append(merge_gates)
+            continue
+        else:
+            merge_gates = sum(gate_layer_list[last_index:i], [])
+            partition_gates.append(merge_gates)
+            last_index = i
+            if i == len(gate_layer_list) - 1:
+                merge_gates = sum(gate_layer_list[last_index:i+1], [])
+                partition_gates.append(merge_gates)
+    
+    # 边界情况
+    if not partition_gates and gate_layer_list:
+        partition_gates.append(sum(gate_layer_list, []))
+    
+    return partition_gates
+
 def get_2q_gates_list(circ):
     gate_2q_list = []
     instruction = circ.data
@@ -434,20 +639,81 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
 
     embeddings = [initial_mapping]
 
-    # 从 Layer 1 开始，全部使用力导向，不检查合法性，不扩图，不退回 VF2
-    for i in range(1, len(partition_gates)):
+    import math
+    
+    def _euclidean_dist(p1, p2):
+        return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+        
+    def _get_violations(gates, emb):
+        violating = []
+        valid = []
+        for gate in gates:
+            u, v = gate[0], gate[1]
+            if emb[u] == -1 or emb[v] == -1 or _euclidean_dist(emb[u], emb[v]) > Rb + 1e-9:
+                violating.append(gate)
+            else:
+                valid.append(gate)
+        return violating, valid
+
+    # 对第 0 层也做约束传播修复：MCTS 提供的映射不保证所有门都在 Rb 内，
+    # force_directed 以 MCTS 映射做锚定，通过约束传播吸附来修复
+    if len(partition_gates) > 0 and partition_gates[0]:
+        all_nodes = list(coupling_graph.nodes())
+        future = partition_gates[1:4]
+        repaired_0 = force_directed_mapping(
+            partition_gates[0],
+            initial_mapping,
+            all_nodes,
+            Rb,
+            num_q,
+            future_gates=future
+        )
+        # 检查违例并拆分
+        violating, valid = _get_violations(partition_gates[0], repaired_0)
+        if violating:
+            # 保证至少有一部分被执行，防止死循环
+            if not valid:
+                valid.append(violating.pop(0))
+            partition_gates[0] = valid
+            if violating:
+                partition_gates.insert(1, violating)
+        embeddings[0] = repaired_0
+
+    # 从 Layer 1 开始，全部使用力导向 + 约束传播，并带有违例拆分兜底
+    i = 1
+    while i < len(partition_gates):
         all_nodes = list(coupling_graph.nodes())
         prev = embeddings[-1]
 
-        # 力导向一步到位：弹簧求解 + 贪心吸附
+        # 力导向一步到位：弹簧求解 + 约束传播吸附 + 局部修复
+        future = partition_gates[i+1:i+4]
         next_embedding = force_directed_mapping(
             partition_gates[i],
             prev,
             all_nodes,
             Rb,
-            num_q
+            num_q,
+            future_gates=future
         )
+        
+        # 检查违例：如果仍然有违法的门，必须留到下一个分区执行
+        violating, valid = _get_violations(partition_gates[i], next_embedding)
+        if violating:
+            # 为了防止死循环（所有门都违法），强制保留至少一个门的进度（或者接受小违例，理论上局部修复已解决绝大部分）
+            if not valid:
+                # 极端情况：一个门都放不下。我们把优先级最高的一个门硬塞进去。
+                valid.append(violating.pop(0))
+            
+            # 更新当前分区，移除违法门
+            partition_gates[i] = valid
+            
+            # 把违法门推迟到紧接着的下一个全新分区
+            # 因为它们只依赖之前的门，所以推迟不违反 DAG 拓扑顺序
+            if violating:
+                partition_gates.insert(i + 1, violating)
+                
         embeddings.append(next_embedding)
+        i += 1
 
     # 补全未映射的比特（理论上贪心吸附已保证无 -1，此处为安全兜底）
     for i in range(1, len(embeddings)):

@@ -148,15 +148,15 @@ class MCTSEngine:
                 self.layer0_edges.add((gate[0], gate[1]))
                 self.layer0_edges.add((gate[1], gate[0]))  # 无向
         
-        # 预处理：构建前5层的连接关系（用于比特选择策略）
+        # 预处理：构建前15层的连接关系（用于比特选择策略）
         # 让 _select_next_qubit 能"顺藤摸瓜"，优先放将来要交互的比特
         self.lookahead_edges = set()
-        for layer in self.layers[:5]:
+        for layer in self.layers[:15]:
             for gate in layer:
                 self.lookahead_edges.add((gate[0], gate[1]))
                 self.lookahead_edges.add((gate[1], gate[0]))
         
-        # 预处理：计算每个逻辑比特在前5层中的连接度（度数越高 = Hub 比特）
+        # 预处理：计算每个逻辑比特在前15层中的连接度（度数越高 = Hub 比特）
         # 用于中心性启发式：Hub 比特应优先放在网格中心区域
         self.qubit_degree = {}
         for q in self.all_qubits:
@@ -233,7 +233,7 @@ class MCTSEngine:
         """
         选择下一个要放置的逻辑比特。
         
-        策略：优先选择与已放置比特在前5层有门连接的比特，
+        策略：优先选择与已放置比特在前15层有门连接的比特，
         让 MCTS 像"顺藤摸瓜"一样，把将来要交互的比特提前聚拢。
         
         Args:
@@ -256,7 +256,7 @@ class MCTSEngine:
                 if (qubit, mapped_qubit) in self.layer0_edges:
                     return qubit
         
-        # 第二优先级：寻找与已放置比特在前5层有连接的（前瞻聚拢）
+        # 第二优先级：寻找与已放置比特在前15层有连接的（前瞻聚拢）
         for qubit in unmapped_qubits:
             for mapped_qubit in mapped_set:
                 if (qubit, mapped_qubit) in self.lookahead_edges:
@@ -286,7 +286,7 @@ class MCTSEngine:
         """
         available_list = list(available)
         
-        # 查找该比特在前5层中已放置的邻居位置
+        # 查找该比特在前15层中已放置的邻居位置
         neighbor_positions = []
         for mapped_q, mapped_pos in current_mapping.items():
             if (qubit, mapped_q) in self.lookahead_edges:
@@ -430,7 +430,7 @@ class MCTSEngine:
         估算给定映射的保真度分数。
         
         模拟逻辑：
-        1. 向前看 5 层门
+        1. 向前看 15 层门
         2. 对每层计算物理移动代价，乘以层权重衰减因子
         3. 使用物理公式估算保真度衰减
         
@@ -447,8 +447,8 @@ class MCTSEngine:
         sim_mapping = deepcopy(mapping)
         
         # 模拟参数
-        layers_to_simulate = min(5, len(self.layers))
-        layer_decay = 0.8  # 层权重衰减因子：Layer0=1.0, Layer1=0.8, Layer2=0.64...
+        layers_to_simulate = min(15, len(self.layers))
+        layer_decay = 0.9  # 层权重衰减因子：更平缓，让后续层也有足够权重
         
         total_move_time = 0.0  # 总移动时间（加权后）
         total_trans_count = 0.0  # 抓取/放下次数（加权后，改为 float）
@@ -558,18 +558,27 @@ class MCTSEngine:
     def search(self, max_iterations: int = 1000) -> dict:
         """
         执行 MCTS 搜索，返回最优的初始映射。
+        内置早停机制：连续 PATIENCE 次迭代没有发现更优映射则提前终止。
         
         Args:
-            max_iterations: 最大迭代次数
+            max_iterations: 最大迭代次数（上限）
         
         Returns:
             最优映射字典 {logic_qubit: (x, y)}
         """
+        # 早停参数：动态耐心值，小电路少等，大电路多等
+        num_qubits = len(self.all_qubits)
+        patience = max(30, num_qubits * 3)
+        
         # 创建根节点
         root = MCTSNode(
             mapping={},
             unmapped_qubits=list(self.all_qubits)
         )
+        
+        best_fidelity = -1.0
+        no_improve_count = 0
+        actual_iterations = 0
         
         for iteration in range(max_iterations):
             node = root
@@ -594,6 +603,23 @@ class MCTSEngine:
             
             # === Backpropagation ===
             self._backpropagate(node, reward)
+            
+            actual_iterations = iteration + 1
+            
+            # === Early Stopping ===
+            if reward > best_fidelity:
+                best_fidelity = reward
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+            
+            if no_improve_count >= patience:
+                print(f"  [MCTS] Early stop at iteration {actual_iterations}/{max_iterations} "
+                      f"(no improvement for {patience} rounds)")
+                break
+        
+        if no_improve_count < patience:
+            print(f"  [MCTS] Completed all {actual_iterations} iterations")
         
         # 返回访问次数最多的路径对应的映射
         return self._extract_best_mapping(root)

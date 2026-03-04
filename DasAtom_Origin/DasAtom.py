@@ -142,7 +142,7 @@ class SingleFileProcessor:
             f'{self.qasm_filename}_rb{self.interaction_radius:.3g}.xlsx'
         )
         for item in self.file_process_log:
-            ws.append(item)
+            ws.append([str(v) if not isinstance(v, (int, float, str)) else v for v in item])
         if self.save_circuit_results:
             wb.save(save_file_name)
 
