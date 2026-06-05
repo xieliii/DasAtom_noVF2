@@ -3,6 +3,7 @@ import time
 import math
 from openpyxl import Workbook
 import warnings
+from collections import Counter
 from Enola.route import QuantumRouter
 from DasAtom_fun import *
 from mcts_mapper import mcts_initial_mapping
@@ -111,16 +112,34 @@ class SingleFileProcessor:
         ws = wb.active
         start_time = time.time()
 
-        # 1) Create circuit from QASM, then extract 2-qubit gates and DAG
-        # 1) 从 QASM 创建电路，然后提取 2 量子比特门和 DAG
+        # 1) Create circuit from QASM, extract gate statistics and 2-qubit DAG
+        # 1) 从 QASM 创建电路，提取门统计信息和 2 量子比特 DAG
         qasm_circuit = CreateCircuitFromQASM(self.qasm_filename, self.circuit_folder)
+        total_gate_count = len(qasm_circuit.data)
+        one_qubit_gate_count = sum(1 for ins in qasm_circuit.data if ins.operation.num_qubits == 1)
         two_qubit_gates_list = get_2q_gates_list(qasm_circuit)
-        assert two_qubit_gates_list, f"a wrong circuit which have no cz in {self.qasm_filename}"
-        qc_object, dag_object = gates_list_to_QC(two_qubit_gates_list)
+        other_gate_count = total_gate_count - one_qubit_gate_count - len(two_qubit_gates_list)
+
+        if other_gate_count > 0:
+            raise ValueError(
+                f"Unsupported gates (>2 qubits) in {self.qasm_filename}: {other_gate_count} gates."
+            )
+
+        if two_qubit_gates_list:
+            qc_object, dag_object = gates_list_to_QC(two_qubit_gates_list)
+        else:
+            qc_object, dag_object = qasm_circuit, None
 
         # 2) Determine key architecture parameters
         # 2) 确定关键架构参数
-        num_qubits, num_cz_gates, grid_size = self._compute_architecture_parameters(two_qubit_gates_list)
+        num_qubits, num_cz_gates, grid_size = self._compute_architecture_parameters(
+            two_qubit_gates_list,
+            qasm_circuit.num_qubits
+        )
+        full_circuit_depth = qasm_circuit.depth()
+        self.file_process_log.append(["Total gates (full circuit)", total_gate_count])
+        self.file_process_log.append(["1Q gates (preserved)", one_qubit_gate_count])
+        self.file_process_log.append(["2Q gates (scheduled)", num_cz_gates])
 
         # 3) Generate coupling graph based on the interaction radius
         # 3) 基于相互作用半径生成耦合图
@@ -128,28 +147,49 @@ class SingleFileProcessor:
 
         # 4) Get or create partitions
         # 4) 获取或创建分区
-        partitioned_gates = self._retrieve_or_generate_partitions(self.qasm_filename, coupling_graph, dag_object)
+        if num_cz_gates == 0:
+            partitioned_gates = []
+        else:
+            partitioned_gates = self._retrieve_or_generate_partitions(self.qasm_filename, coupling_graph, dag_object)
 
         # 5) Get or create embeddings
         # 5) 获取或创建嵌入
-        embeddings, grid_size = self._retrieve_or_generate_embeddings(
-            self.qasm_filename,
-            partitioned_gates,
-            coupling_graph,
-            num_qubits,
-            grid_size,
-            dag_object
-        )
+        if num_cz_gates == 0:
+            embeddings = []
+        else:
+            original_grid_size = grid_size
+            embeddings, grid_size = self._retrieve_or_generate_embeddings(
+                self.qasm_filename,
+                partitioned_gates,
+                coupling_graph,
+                num_qubits,
+                grid_size,
+                dag_object
+            )
+            if grid_size != original_grid_size:
+                coupling_graph = self._generate_coupling_graph(grid_size)
 
         # 6) Generate parallel gates and all movement operations
         # 6) 生成并行门和所有移动操作
-        parallel_gates, movements_list, merged_parallel_gates = self._compute_gates_and_movements(
-            num_qubits,
-            partitioned_gates,
-            embeddings,
-            coupling_graph,
-            grid_size
-        )
+        if num_cz_gates == 0:
+            parallel_gates, movements_list, merged_parallel_gates = [], [], []
+        else:
+            strict_validate = os.environ.get("DASATOM_STRICT_VALIDATE", "0") == "1"
+            if strict_validate:
+                self._validate_schedule_correctness(
+                    qasm_circuit=qasm_circuit,
+                    original_two_qubit_gates=two_qubit_gates_list,
+                    partitioned_gates=partitioned_gates,
+                    embeddings=embeddings,
+                    coupling_graph=coupling_graph
+                )
+            parallel_gates, movements_list, merged_parallel_gates = self._compute_gates_and_movements(
+                num_qubits,
+                partitioned_gates,
+                embeddings,
+                coupling_graph,
+                grid_size
+            )
 
         # 7) Compute fidelity/time metrics
         # 7) 计算保真度/时间指标
@@ -164,7 +204,7 @@ class SingleFileProcessor:
         # 8) Log final stats for this file
         # 8) 记录此文件的最终统计信息
         self.file_process_log.append(["Total processing time", total_time_now - start_time])
-        self.file_process_log.append(["Original circuit depth", qc_object.depth()])
+        self.file_process_log.append(["Original circuit depth", full_circuit_depth])
         self.file_process_log.append(["Fidelity", fidelity])
         self.file_process_log.append(["Idle time", idle_time])
         self.file_process_log.append(["Movement fidelity", move_fidelity])
@@ -193,7 +233,7 @@ class SingleFileProcessor:
             self.qasm_filename,
             num_qubits,
             num_cz_gates,
-            qc_object.depth(),
+            full_circuit_depth,
             fidelity,
             move_fidelity,
             len(movements_list),
@@ -207,7 +247,72 @@ class SingleFileProcessor:
             idle_time
         ]
 
-    def _compute_architecture_parameters(self, two_qubit_gates_list):
+    def _validate_schedule_correctness(
+        self,
+        qasm_circuit,
+        original_two_qubit_gates,
+        partitioned_gates,
+        embeddings,
+        coupling_graph
+    ):
+        """
+        Strict correctness checks for schedule integrity:
+        1) all 2Q gates are preserved (no drop / no duplicate),
+        2) every embedding is complete and collision-free,
+        3) every scheduled 2Q gate satisfies Rb in its partition embedding.
+        """
+        flattened = [tuple(g) for part in partitioned_gates for g in part]
+        if len(flattened) != len(original_two_qubit_gates):
+            raise RuntimeError(
+                f"2Q gate count mismatch: original={len(original_two_qubit_gates)}, scheduled={len(flattened)}"
+            )
+
+        original_counter = Counter(tuple(sorted(g)) for g in original_two_qubit_gates)
+        scheduled_counter = Counter(tuple(sorted(g)) for g in flattened)
+        if original_counter != scheduled_counter:
+            raise RuntimeError("2Q gate multiset mismatch between original circuit and scheduled partitions.")
+
+        if len(partitioned_gates) != len(embeddings):
+            raise RuntimeError(
+                f"Partition/embedding length mismatch: partitions={len(partitioned_gates)}, embeddings={len(embeddings)}"
+            )
+
+        legal_nodes = {tuple(n) for n in coupling_graph.nodes()}
+        for part_idx, embedding in enumerate(embeddings):
+            if len(embedding) != qasm_circuit.num_qubits:
+                raise RuntimeError(
+                    f"Embedding length mismatch at partition {part_idx}: got={len(embedding)}, expected={qasm_circuit.num_qubits}"
+                )
+
+            occupied = set()
+            for q_idx, pos in enumerate(embedding):
+                if pos == -1:
+                    raise RuntimeError(f"Unmapped qubit at partition {part_idx}, qubit={q_idx}.")
+                pos_t = tuple(pos)
+                if pos_t not in legal_nodes:
+                    raise RuntimeError(f"Illegal physical location at partition {part_idx}: {pos_t}")
+                if pos_t in occupied:
+                    raise RuntimeError(f"Collision at partition {part_idx}: duplicated location {pos_t}")
+                occupied.add(pos_t)
+
+            for gate in partitioned_gates[part_idx]:
+                u, v = gate[0], gate[1]
+                dist = euclidean_distance(tuple(embedding[u]), tuple(embedding[v]))
+                if dist > self.interaction_radius + 1e-9:
+                    raise RuntimeError(
+                        f"Rb violation at partition {part_idx}, gate={gate}, dist={dist:.6f}, Rb={self.interaction_radius}"
+                    )
+
+        one_qubit_gate_count = sum(1 for ins in qasm_circuit.data if ins.operation.num_qubits == 1)
+        full_gate_count = len(qasm_circuit.data)
+        if one_qubit_gate_count + len(original_two_qubit_gates) != full_gate_count:
+            raise RuntimeError(
+                "Full-circuit gate accounting failed: 1Q + 2Q does not match total instruction count."
+            )
+
+        self.file_process_log.append(["Strict schedule validation", "PASS"])
+
+    def _compute_architecture_parameters(self, two_qubit_gates_list, fallback_num_qubits):
         """
         Compute the number of qubits, the number of gates, and an initial grid dimension
         for the architecture based on the QASM file's gate set.
@@ -215,10 +320,14 @@ class SingleFileProcessor:
 
         :param two_qubit_gates_list: The list of extracted 2-qubit gates.
         :param two_qubit_gates_list: 提取的 2 量子比特门列表。
+        :param fallback_num_qubits: Number of qubits from the full circuit when no 2Q gate exists.
         :return: (num_qubits, num_cz_gates, grid_size)
         """
         num_cz_gates = len(two_qubit_gates_list)
-        num_qubits = get_qubits_num(two_qubit_gates_list)
+        if two_qubit_gates_list:
+            num_qubits = get_qubits_num(two_qubit_gates_list)
+        else:
+            num_qubits = fallback_num_qubits
         grid_size = math.ceil(math.sqrt(num_qubits))
 
         self.file_process_log.append(["Number of CZ gates", num_cz_gates])
@@ -319,13 +428,85 @@ class SingleFileProcessor:
         else:
             start_embed_time = time.time()
             init_map_list = None
+            verbose_init = os.environ.get("DASATOM_VERBOSE_INIT", "0") == "1"
 
             if self.engine in ('dual', 'noVF2'):
-                # --- MCTS: 为第 0 层分区生成最优初始映射 ---
-                # 自适应迭代次数：大幅降低基数避免小电路“杀鸡用牛刀”，大电路呈二次方增长保证质量
-                adaptive_iterations = int(max(100, (num_qubits ** 2) * 10))
-                print(f"  [MCTS] Searching for optimal initial mapping for {filename}...")
-                print(f"  [MCTS] Adaptive iterations: {adaptive_iterations} (qubits={num_qubits})")
+                # --- MCTS: 为第 0 层分区生成初始映射 ---
+                # noVF2 走 MCTS-first，不再使用静态/确定性 seed 取代初始搜索。
+                first_partition_size = len(partitioned_gates[0]) if partitioned_gates else 0
+                fp_graph = nx.Graph()
+                if partitioned_gates:
+                    fp_graph.add_edges_from(partitioned_gates[0])
+                fp_nodes = fp_graph.number_of_nodes()
+                fp_edges = fp_graph.number_of_edges()
+                fp_avg_deg = (2.0 * fp_edges / fp_nodes) if fp_nodes else 0.0
+                fp_max_deg = max((d for _, d in fp_graph.degree()), default=0)
+                fp_hub_like = (
+                    fp_nodes >= 6 and
+                    fp_avg_deg <= 2.2 and
+                    fp_max_deg >= min(fp_nodes - 1, max(4, fp_nodes // 2))
+                )
+                if num_qubits <= 8:
+                    adaptive_iterations = int(max(8, max(1, fp_nodes) + 2))
+                elif num_qubits <= 10:
+                    adaptive_iterations = int(max(12, int(1.5 * max(1, fp_nodes)) + max(3, first_partition_size // 3)))
+                elif num_qubits <= 16:
+                    adaptive_iterations = int(
+                        max(
+                            48,
+                            min(
+                                3600,
+                                (num_qubits ** 2) * 5 + first_partition_size * max(1, num_qubits // 6)
+                            )
+                        )
+                    )
+                else:
+                    adaptive_iterations = int(
+                        max(
+                            80,
+                            min(
+                                7000,
+                                (num_qubits ** 2) * 6 + first_partition_size * max(1, num_qubits // 7)
+                            )
+                        )
+                    )
+                if fp_nodes and fp_edges == max(0, fp_nodes - 1) and fp_max_deg <= 4:
+                    tree_cap = max(12, int(fp_nodes * 1.5))
+                    if fp_max_deg <= 2:
+                        tree_cap = max(10, fp_nodes // 2 + 4)
+                    adaptive_iterations = min(adaptive_iterations, tree_cap)
+                elif fp_hub_like:
+                    hub_cap = max(8, fp_nodes // 2 + 2)
+                    if num_qubits <= 14:
+                        hub_cap = min(hub_cap, 10)
+                    adaptive_iterations = min(adaptive_iterations, hub_cap)
+                elif fp_nodes and fp_avg_deg <= 2.2 and fp_max_deg <= 5:
+                    adaptive_iterations = max(20, int(adaptive_iterations * 0.18))
+                elif fp_nodes and fp_avg_deg >= 3.0:
+                    adaptive_iterations = min(8000, int(adaptive_iterations * 1.15))
+                if num_qubits <= 10 and fp_avg_deg >= 2.8:
+                    dense_cap = max(4, fp_nodes // 2)
+                    if num_qubits <= 8:
+                        dense_cap = max(2, dense_cap - 2)
+                    adaptive_iterations = min(adaptive_iterations, dense_cap)
+                if num_qubits >= 14 and fp_avg_deg >= 5.5:
+                    dense_large_cap = max(24, min(96, fp_nodes * 3))
+                    adaptive_iterations = min(adaptive_iterations, dense_large_cap)
+                if num_qubits <= 6:
+                    small_cap = 4
+                    if fp_max_deg <= 2:
+                        small_cap = 3
+                    elif fp_avg_deg >= 3.0:
+                        small_cap = 2
+                    adaptive_iterations = min(adaptive_iterations, small_cap)
+                if num_qubits <= 14 and fp_nodes <= 6 and first_partition_size <= 6 and fp_avg_deg <= 2.0:
+                    adaptive_iterations = min(adaptive_iterations, 4)
+                if verbose_init:
+                    print(f"  [MCTS] Searching for optimal initial mapping for {filename}...")
+                    print(
+                        f"  [MCTS] Adaptive iterations: {adaptive_iterations} "
+                        f"(qubits={num_qubits}, first_partition_gates={first_partition_size})"
+                    )
                 mcts_start = time.time()
                 mcts_dict = mcts_initial_mapping(
                     dag_object,
@@ -335,7 +516,9 @@ class SingleFileProcessor:
                     max_iterations=adaptive_iterations
                 )
                 mcts_time = time.time() - mcts_start
-                print(f"  [MCTS] Done in {mcts_time:.2f}s, mapped {len(mcts_dict)} qubits")
+                if verbose_init:
+                    print(f"  [MCTS] Done in {mcts_time:.2f}s, mapped {len(mcts_dict)} qubits")
+                self.file_process_log.append(["Initial mapping method", "mcts_primary"])
                 self.file_process_log.append(["MCTS search time", mcts_time])
 
                 # 格式转换：MCTS 字典 {logic_qubit: (x,y)} -> 列表格式
@@ -343,19 +526,25 @@ class SingleFileProcessor:
                 for q, pos in mcts_dict.items():
                     if q < num_qubits:
                         init_map_list[q] = pos
+                embeddings, extended_positions = get_embeddings(
+                    partitioned_gates,
+                    coupling_graph,
+                    num_qubits,
+                    grid_size,
+                    self.interaction_radius,
+                    initial_mapping=init_map_list
+                )
             else:
-                # --- Baseline 模式：由 DasAtom_Origin 处理，此处不应到达 ---
-                print(f"  [Baseline] Using pure VF2 for {filename}")
+                # Baseline: pure VF2 embedding path (compatible with DasAtom_Origin)
                 self.file_process_log.append(["MCTS search time", 0])
-
-            embeddings, extended_positions = get_embeddings(
-                partitioned_gates,
-                coupling_graph,
-                num_qubits,
-                grid_size,
-                self.interaction_radius,
-                initial_mapping=init_map_list
-            )
+                embeddings, extended_positions = get_embeddings_vf2(
+                    partitioned_gates,
+                    coupling_graph,
+                    num_qubits,
+                    grid_size,
+                    self.interaction_radius,
+                    initial_mapping=None
+                )
             self.file_process_log.append(["Embedding computation time", time.time() - start_embed_time])
 
             if self.save_partitions_and_embeddings:

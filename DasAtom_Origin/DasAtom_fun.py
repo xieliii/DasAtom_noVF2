@@ -318,7 +318,7 @@ def get_parallel_gates(gates, coupling_graph, mapping, r_re):
 
     return para'''
 
-def set_parameters(T_cz = 0.2, T_eff = 1.5e6, T_trans=20, AOD_width=3,AOD_height=3,Move_speed=0.55,F_cz=0.995, F_trans = 1):
+def set_parameters(T_cz = 0.2, T_eff = 1.5e6, T_trans=20, AOD_width=3,AOD_height=3,Move_speed=0.55,F_cz=0.995, F_trans = 0.9981):
     para = {}
     para['T_cz'] = T_cz  #us
     para['T_eff'] = T_eff #us

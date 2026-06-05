@@ -1,6 +1,8 @@
 import math
 from networkx import maximal_independent_set, Graph
 
+WARN_ZERO_MOVEMENTS = False
+
 
 def compatible_2D(a: list[int], b: list[int]) -> bool:
     """
@@ -204,10 +206,12 @@ class QuantumRouter:
         for current_pos in range(len(self.embeddings) - 1):
             movements = self.resolve_movements(current_pos)
             if len(movements) == 0:
-                # 警告：相邻分区嵌入完全相同，可能存在布局问题
-                import warnings
-                warnings.warn(f"Zero movements between embedding {current_pos} and {current_pos+1}, "
-                              "this may indicate a layout issue")
+                if WARN_ZERO_MOVEMENTS:
+                    import warnings
+                    warnings.warn(
+                        f"Zero movements between embedding {current_pos} and {current_pos+1}, "
+                        "this may indicate a layout issue"
+                    )
                 self.movement_list.append([])
             else:
                 self.movement_list.append(movements)

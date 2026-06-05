@@ -29,3 +29,11 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local experiment scratch/results
+.tmp_*/
+**/.tmp_*/
+**/.tmp_*
+DasAtom/res/
+*.prof
+out.csv

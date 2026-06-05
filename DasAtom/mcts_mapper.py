@@ -9,10 +9,9 @@ MCTS 初始映射模块 (mcts_mapper.py)
 """
 
 import math
-import random
+import os
 import networkx as nx
 import numpy as np
-from copy import deepcopy
 from DasAtom_fun import set_parameters, get_layer_gates
 
 
@@ -39,6 +38,9 @@ class MCTSNode:
         self.children = []
         self.visits = 0      # 访问次数 N
         self.value = 0.0     # 累积保真度评分 Q
+        self.occupied_positions = set(self.mapping.values())
+        self.rollout_mapping = None
+        self.rollout_reward = None
         
         # 记录该节点尝试过的动作 (qubit, position) 对
         self.tried_actions = set()
@@ -102,7 +104,7 @@ class MCTSNode:
     
     def get_occupied_positions(self) -> set:
         """获取当前映射中已被占用的物理位置集合。"""
-        return set(self.mapping.values())
+        return self.occupied_positions
 
 
 class MCTSEngine:
@@ -138,15 +140,18 @@ class MCTSEngine:
         # 解析电路层
         self.layers = get_layer_gates(dag)
         
-        # 提取所有涉及的逻辑比特
-        self.all_qubits = self._extract_all_qubits()
+        # 提取所有涉及的逻辑比特（排序以保证跨运行稳定）
+        self.all_qubits = sorted(self._extract_all_qubits())
         
         # 预处理：构建第一层的连接关系（用于几何剪枝）
         self.layer0_edges = set()
+        self.layer0_neighbors = {}
         if self.layers:
             for gate in self.layers[0]:
                 self.layer0_edges.add((gate[0], gate[1]))
                 self.layer0_edges.add((gate[1], gate[0]))  # 无向
+                self.layer0_neighbors.setdefault(gate[0], set()).add(gate[1])
+                self.layer0_neighbors.setdefault(gate[1], set()).add(gate[0])
         
         # 预处理：构建前15层的连接关系（用于比特选择策略）
         # 让 _select_next_qubit 能"顺藤摸瓜"，优先放将来要交互的比特
@@ -155,12 +160,50 @@ class MCTSEngine:
             for gate in layer:
                 self.lookahead_edges.add((gate[0], gate[1]))
                 self.lookahead_edges.add((gate[1], gate[0]))
+        self.lookahead_neighbors = {}
+        for u, v in self.lookahead_edges:
+            self.lookahead_neighbors.setdefault(u, set()).add(v)
+
+        self.qubit_activity = {q: 0.0 for q in self.all_qubits}
+        self.frontier_activity = {q: 0.0 for q in self.all_qubits}
+        for layer_idx, layer in enumerate(self.layers[:10]):
+            layer_weight = 0.88 ** layer_idx
+            for gate in layer:
+                u, v = gate[0], gate[1]
+                self.qubit_activity[u] += layer_weight
+                self.qubit_activity[v] += layer_weight
+                if layer_idx < 4:
+                    self.frontier_activity[u] += layer_weight
+                    self.frontier_activity[v] += layer_weight
         
         # 预处理：计算每个逻辑比特在前15层中的连接度（度数越高 = Hub 比特）
         # 用于中心性启发式：Hub 比特应优先放在网格中心区域
         self.qubit_degree = {}
         for q in self.all_qubits:
             self.qubit_degree[q] = sum(1 for (a, b) in self.lookahead_edges if a == q)
+        self.layer0_degree = {q: len(self.layer0_neighbors.get(q, set())) for q in self.all_qubits}
+        self.search_qubits = self._select_search_qubits()
+        self.search_qubit_set = set(self.search_qubits)
+        self.rollout_qubits = [q for q in self.all_qubits if q not in self.search_qubit_set]
+        self.rollout_order = sorted(
+            self.rollout_qubits,
+            key=lambda q: (
+                self.frontier_activity.get(q, 0.0),
+                self.qubit_activity.get(q, 0.0),
+                self.qubit_degree.get(q, 0),
+                -q
+            ),
+            reverse=True
+        )
+        if len(self.all_qubits) <= 8:
+            self.rank_cap_floor = 4
+            self.rank_cap_ceiling = 8
+        elif len(self.all_qubits) <= 14:
+            self.rank_cap_floor = 5
+            self.rank_cap_ceiling = 10
+        else:
+            self.rank_cap_floor = 6
+            self.rank_cap_ceiling = 12
         
         # 预计算物理网格的几何中心坐标
         all_nodes = list(architecture_graph.nodes())
@@ -171,6 +214,20 @@ class MCTSEngine:
         
         # 物理节点坐标字典 (已经是 (x, y) 格式，直接使用)
         self.node_coords = self._build_node_coords()
+        self.arch_nodes = tuple(self.arch_graph.nodes())
+        self.arch_nodes_set = set(self.arch_nodes)
+        self.center_distance = {
+            node: math.hypot(node[0] - self.grid_center[0], node[1] - self.grid_center[1])
+            for node in self.arch_nodes
+        }
+        self.node_distance = {}
+        for i, a in enumerate(self.arch_nodes):
+            ax, ay = a
+            for b in self.arch_nodes[i:]:
+                bx, by = b
+                d = math.hypot(bx - ax, by - ay)
+                self.node_distance[(a, b)] = d
+                self.node_distance[(b, a)] = d
     
     def _extract_all_qubits(self) -> set:
         """从所有层中提取涉及的逻辑比特集合。"""
@@ -196,12 +253,91 @@ class MCTSEngine:
             # 节点本身就是 (x, y) 元组
             coords[node] = node
         return coords
+
+    def _select_search_qubits(self) -> list:
+        """只让 MCTS 重搜索前沿核心比特，其余比特交给启发式补全。"""
+        avg_qubit_degree = sum(self.qubit_degree.values()) / max(1, len(self.all_qubits))
+        chain_like = (
+            max(self.layer0_degree.values(), default=0) <= 2 and
+            max(self.qubit_degree.values(), default=0) <= 3
+        )
+        hub_like = (
+            (
+                max(self.layer0_degree.values(), default=0) >= min(max(3, len(self.all_qubits) // 3), len(self.all_qubits) - 1) or
+                max(self.qubit_degree.values(), default=0) >= min(len(self.all_qubits) - 1, max(4, len(self.all_qubits) // 2))
+            ) and
+            avg_qubit_degree <= 3.0
+        )
+        dense_small = (
+            len(self.all_qubits) <= 10 and
+            avg_qubit_degree >= 4.0
+        )
+        dense_frontier_sparse = (
+            len(self.all_qubits) >= 12 and
+            avg_qubit_degree >= 5.0 and
+            max(self.layer0_degree.values(), default=0) <= 1
+        )
+        self.chain_like = chain_like
+        self.hub_like = hub_like
+        self.dense_small = dense_small
+        self.dense_frontier_sparse = dense_frontier_sparse
+        if len(self.all_qubits) <= 8 and not dense_small and not chain_like and not hub_like:
+            return list(self.all_qubits)
+
+        focus_qubits = set()
+        for layer in self.layers[:4]:
+            for gate in layer:
+                focus_qubits.add(gate[0])
+                focus_qubits.add(gate[1])
+
+        if dense_small:
+            target_size = min(len(self.all_qubits), 4 if len(self.all_qubits) <= 8 else 8)
+        elif dense_frontier_sparse:
+            target_size = min(len(self.all_qubits), 8 if len(self.all_qubits) <= 20 else 9)
+        elif hub_like:
+            target_size = min(len(self.all_qubits), 4 if len(self.all_qubits) <= 8 else 5)
+        elif chain_like:
+            target_size = min(len(self.all_qubits), 4 if len(self.all_qubits) <= 8 else (5 if len(self.all_qubits) <= 12 else 7))
+        elif len(self.all_qubits) <= 16:
+            target_size = min(len(self.all_qubits), max(6, len(focus_qubits) + 2))
+        else:
+            target_size = min(len(self.all_qubits), max(8, len(focus_qubits) + 2, int(len(self.all_qubits) * 0.45)))
+
+        ranked = sorted(
+            self.all_qubits,
+            key=lambda q: (
+                q in focus_qubits,
+                self.frontier_activity.get(q, 0.0),
+                self.layer0_degree.get(q, 0),
+                self.qubit_activity.get(q, 0.0),
+                self.qubit_degree.get(q, 0),
+                -q
+            ),
+            reverse=True
+        )
+
+        chosen = []
+        chosen_set = set()
+        for q in ranked:
+            if len(chosen) >= target_size:
+                break
+            chosen.append(q)
+            chosen_set.add(q)
+
+        for q in ranked:
+            if q not in chosen_set and self.layer0_degree.get(q, 0) >= 2 and len(chosen) < min(len(self.all_qubits), target_size + 1):
+                chosen.append(q)
+                chosen_set.add(q)
+
+        return chosen
     
     def _euclidean_distance(self, pos1: tuple, pos2: tuple) -> float:
         """计算两个物理位置之间的欧几里得距离。"""
+        if pos1 in self.arch_nodes_set and pos2 in self.arch_nodes_set:
+            return self.node_distance[(pos1, pos2)]
         x1, y1 = pos1
         x2, y2 = pos2
-        return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        return math.hypot(x2 - x1, y2 - y1)
     
     def _is_valid_placement(self, qubit: int, position: tuple, 
                             current_mapping: dict) -> bool:
@@ -219,13 +355,16 @@ class MCTSEngine:
         Returns:
             True 如果放置合法
         """
-        for mapped_qubit, mapped_pos in current_mapping.items():
-            # 检查是否在 Layer 0 有连接
-            if (qubit, mapped_qubit) in self.layer0_edges:
-                # 计算物理距离
-                distance = self._euclidean_distance(position, mapped_pos)
-                if distance > self.Rb:
-                    return False  # 违反距离约束
+        neighbors = self.layer0_neighbors.get(qubit)
+        if not neighbors:
+            return True
+        for mapped_qubit in neighbors:
+            mapped_pos = current_mapping.get(mapped_qubit)
+            if mapped_pos is None:
+                continue
+            distance = self._euclidean_distance(position, mapped_pos)
+            if distance > self.Rb:
+                return False  # 违反距离约束
         return True
     
     def _select_next_qubit(self, unmapped_qubits: list, 
@@ -244,37 +383,47 @@ class MCTSEngine:
             选中的逻辑比特 ID
         """
         if not current_mapping:
-            # 没有已放置的比特，选择第一层第一个门的第一个比特
-            if self.layers and self.layers[0]:
-                return self.layers[0][0][0]
-            return unmapped_qubits[0]
-        
-        # 第一优先级：寻找与已放置比特在 Layer 0 有连接的（剪枝价值最高）
+            return max(
+                unmapped_qubits,
+                key=lambda q: (
+                    self.layer0_degree.get(q, 0),
+                    self.qubit_degree.get(q, 0),
+                    -q
+                )
+            )
+
         mapped_set = set(current_mapping.keys())
-        for qubit in unmapped_qubits:
-            for mapped_qubit in mapped_set:
-                if (qubit, mapped_qubit) in self.layer0_edges:
-                    return qubit
-        
-        # 第二优先级：寻找与已放置比特在前15层有连接的（前瞻聚拢）
-        for qubit in unmapped_qubits:
-            for mapped_qubit in mapped_set:
-                if (qubit, mapped_qubit) in self.lookahead_edges:
-                    return qubit
-        
-        # 都没有连接关系，返回第一个未放置的
-        return unmapped_qubits[0]
+
+        def _score(qubit):
+            layer0_frontier = len(self.layer0_neighbors.get(qubit, set()) & mapped_set)
+            lookahead_frontier = len(self.lookahead_neighbors.get(qubit, set()) & mapped_set)
+            return (
+                layer0_frontier,
+                lookahead_frontier,
+                self.layer0_degree.get(qubit, 0),
+                self.qubit_degree.get(qubit, 0),
+                -qubit
+            )
+
+        return max(unmapped_qubits, key=_score)
+
+    def _node_fully_expanded(self, node: MCTSNode, available_positions: set) -> bool:
+        """按当前启发式下的有效候选数判断节点是否已扩完。"""
+        if not node.unmapped_qubits:
+            return True
+        next_qubit = self._select_next_qubit(node.unmapped_qubits, node.mapping)
+        candidate_count = len(self._rank_positions(next_qubit, available_positions, node.mapping))
+        tried_for_qubit = sum(1 for action in node.tried_actions if action[0] == next_qubit)
+        return tried_for_qubit >= candidate_count
     
     def _rank_positions(self, qubit: int, available: set,
                         current_mapping: dict) -> list:
         """
-        中心性启发式：对空闲物理位置进行加权随机排序。
+        中心性启发式：对空闲物理位置进行确定性排序。
         
         策略分两种情况：
         - 情况1（无邻居）：Hub 比特优先尝试网格中心区域
         - 情况2（有邻居）：优先尝试已放置的连接比特附近
-        
-        使用加权随机采样保留多样性，避免搜索过于贪心。
         
         Args:
             qubit: 当前要放置的逻辑比特
@@ -298,33 +447,43 @@ class MCTSEngine:
         for pos in available_list:
             if neighbor_positions:
                 # === 情况2：有已放置的邻居 -> 偏好邻居附近的位置 ===
-                # 计算到所有已放置邻居的平均距离，距离越近权重越高
                 avg_dist = sum(
                     self._euclidean_distance(pos, np) for np in neighbor_positions
                 ) / len(neighbor_positions)
                 w = 1.0 / (1.0 + avg_dist)
             else:
                 # === 情况1：无邻居 -> Hub 比特偏好网格中心 ===
-                # 连接度越高的比特，中心吸引力越强
-                dist_to_center = self._euclidean_distance(pos, self.grid_center)
+                dist_to_center = self.center_distance.get(
+                    pos,
+                    self._euclidean_distance(pos, self.grid_center)
+                )
                 degree_ratio = self.qubit_degree.get(qubit, 1) / max_degree
-                # 度数作为"中心引力"的放大器：度越高，距离惩罚越大
                 w = 1.0 / (1.0 + dist_to_center * degree_ratio)
             weights.append(w)
         
-        # 加权随机排序：Efraimidis-Spirakis 加权无放回抽样算法
-        # 给每个位置生成 key = random()^(1/weight)，按 key 降序排列
-        # 权重高的位置更容易排到前面，但仍保留随机性
+        # 确定性排序：先按权重降序，再按到中心距离升序打破平局。
         scored = []
         for pos, w in zip(available_list, weights):
-            r = random.random()
-            if r == 0:
-                r = 1e-10  # 防止 log(0)
-            key = r ** (1.0 / max(w, 1e-10))
-            scored.append((key, pos))
-        
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [pos for _, pos in scored]
+            center_dist = self.center_distance.get(
+                pos,
+                self._euclidean_distance(pos, self.grid_center)
+            )
+            scored.append((w, center_dist, pos))
+
+        scored.sort(key=lambda x: (-x[0], x[1], x[2][0], x[2][1]))
+        rank_cap = min(
+            len(scored),
+            max(
+                self.rank_cap_floor,
+                min(
+                    self.rank_cap_ceiling,
+                    4 + self.layer0_degree.get(qubit, 0) + (1 if neighbor_positions else 0) * 2
+                )
+            )
+        )
+        if not neighbor_positions and self.layer0_degree.get(qubit, 0) <= 1:
+            rank_cap = min(rank_cap, max(4, self.rank_cap_floor))
+        return [pos for _, _, pos in scored[:rank_cap]]
     
     def _expand(self, node: MCTSNode) -> MCTSNode:
         """
@@ -347,7 +506,7 @@ class MCTSEngine:
         
         # 获取已占用和可用的物理位置
         occupied = node.get_occupied_positions()
-        available = set(self.arch_graph.nodes()) - occupied
+        available = self.arch_nodes_set - occupied
         
         if not available:
             return None
@@ -405,24 +564,46 @@ class MCTSEngine:
         """
         mapping = partial_mapping.copy()
         occupied = set(mapping.values())
-        available = list(set(self.arch_graph.nodes()) - occupied)
-        random.shuffle(available)
-        
-        for qubit in unmapped:
+        mapped_set = set(mapping.keys())
+        available = sorted(
+            list(self.arch_nodes_set - occupied),
+            key=lambda p: self.center_distance.get(
+                p,
+                self._euclidean_distance(p, self.grid_center)
+            )
+        )
+        pending = []
+        seen = set(mapped_set)
+        for qubit in list(unmapped) + self.rollout_order:
+            if qubit in seen:
+                continue
+            pending.append(qubit)
+            seen.add(qubit)
+
+        for qubit in pending:
             if available:
-                # 尝试找一个满足 Layer 0 约束的位置
+                mapped_frontier = self.lookahead_neighbors.get(qubit, set()) & mapped_set
+                if not mapped_frontier and self.layer0_degree.get(qubit, 0) <= 1 and self.qubit_activity.get(qubit, 0.0) < 0.75:
+                    pos = available.pop(0)
+                    mapping[qubit] = pos
+                    mapped_set.add(qubit)
+                    continue
+                ranked_positions = self._rank_positions(qubit, set(available), mapping)
                 placed = False
-                for i, pos in enumerate(available):
-                    if self._is_valid_placement(qubit, pos, mapping):
-                        mapping[qubit] = pos
-                        available.pop(i)
-                        placed = True
-                        break
-                
-                # 如果找不到满足约束的，随便选一个
+                for pos in ranked_positions:
+                    if not self._is_valid_placement(qubit, pos, mapping):
+                        continue
+                    mapping[qubit] = pos
+                    available.remove(pos)
+                    mapped_set.add(qubit)
+                    placed = True
+                    break
+
                 if not placed and available:
-                    mapping[qubit] = available.pop()
-        
+                    pos = available.pop(0)
+                    mapping[qubit] = pos
+                    mapped_set.add(qubit)
+
         return mapping
     
     def _estimate_fidelity(self, mapping: dict) -> float:
@@ -444,12 +625,11 @@ class MCTSEngine:
             估算的保真度分数 (0, 1]
         """
         # 创建虚拟映射用于模拟（不修改原映射）
-        sim_mapping = deepcopy(mapping)
+        sim_mapping = mapping.copy()
         
         # 模拟参数
         layers_to_simulate = min(15, len(self.layers))
         layer_decay = 0.9  # 层权重衰减因子：更平缓，让后续层也有足够权重
-        
         total_move_time = 0.0  # 总移动时间（加权后）
         total_trans_count = 0.0  # 抓取/放下次数（加权后，改为 float）
         gate_count = 0           # 门数量（不衰减，用于计算基础保真度）
@@ -504,6 +684,13 @@ class MCTSEngine:
                 
                 gate_count += 1
         
+        center_penalty = 0.0
+        for q in self.all_qubits:
+            pos = sim_mapping.get(q)
+            if pos is None:
+                continue
+            center_penalty += self.center_distance.get(pos, self._euclidean_distance(pos, self.grid_center))
+
         # 计算总时间
         trans_time = total_trans_count * self.params['T_trans']
         gate_time = gate_count * self.params['T_cz']
@@ -517,10 +704,12 @@ class MCTSEngine:
         fidelity = math.exp(-t_idle / self.params['T_eff'])
         fidelity *= (self.params['F_cz'] ** gate_count)
         fidelity *= (self.params['F_trans'] ** total_trans_count)
-        
-        return fidelity
+
+        # Prefer compact layouts for active qubits so force-directed starts closer
+        # to a low-movement solution in later partitions.
+        return fidelity / (1.0 + 0.0025 * center_penalty)
     
-    def _simulate(self, node: MCTSNode) -> float:
+    def _simulate(self, node: MCTSNode):
         """
         从给定节点进行模拟，返回保真度评分。
         
@@ -530,6 +719,9 @@ class MCTSEngine:
         Returns:
             模拟得到的保真度分数
         """
+        if node.rollout_mapping is not None and node.rollout_reward is not None:
+            return node.rollout_reward, node.rollout_mapping
+
         # 如果映射不完整，先贪心补全
         if not node.is_terminal():
             complete_mapping = self._greedy_complete_mapping(
@@ -538,8 +730,10 @@ class MCTSEngine:
         else:
             complete_mapping = node.mapping
         
-        # 估算保真度
-        return self._estimate_fidelity(complete_mapping)
+        reward = self._estimate_fidelity(complete_mapping)
+        node.rollout_mapping = complete_mapping
+        node.rollout_reward = reward
+        return reward, complete_mapping
     
     def _backpropagate(self, node: MCTSNode, reward: float):
         """
@@ -567,16 +761,28 @@ class MCTSEngine:
             最优映射字典 {logic_qubit: (x, y)}
         """
         # 早停参数：动态耐心值，小电路少等，大电路多等
-        num_qubits = len(self.all_qubits)
-        patience = max(30, num_qubits * 3)
-        
+        search_qubits = len(self.search_qubits)
+        if search_qubits <= 8:
+            patience = max(8, min(16, max_iterations // 2))
+        elif search_qubits <= 12:
+            patience = max(12, min(24, max_iterations // 2))
+        else:
+            patience = max(24, min(48, int(search_qubits * 2.5)))
+        if getattr(self, "dense_frontier_sparse", False):
+            patience = max(5, int(patience * 0.5))
+
         # 创建根节点
         root = MCTSNode(
             mapping={},
-            unmapped_qubits=list(self.all_qubits)
+            unmapped_qubits=list(self.search_qubits)
         )
-        
-        best_fidelity = -1.0
+
+        best_mapping = self._greedy_complete_mapping({}, self.search_qubits)
+        best_fidelity = self._estimate_fidelity(best_mapping)
+        if self.dense_small and search_qubits <= 4 and max_iterations <= 2:
+            return best_mapping
+        if search_qubits <= 5 and (self.chain_like or self.hub_like) and max_iterations <= 10:
+            return best_mapping
         no_improve_count = 0
         actual_iterations = 0
         
@@ -586,8 +792,8 @@ class MCTSEngine:
             # === Selection ===
             # 沿着树向下选择，直到找到可扩展的节点或叶节点
             while node.children and not node.is_terminal():
-                available = set(self.arch_graph.nodes()) - node.get_occupied_positions()
-                if node.is_fully_expanded(available):
+                available = self.arch_nodes_set - node.get_occupied_positions()
+                if self._node_fully_expanded(node, available):
                     node = node.best_child()
                 else:
                     break
@@ -599,7 +805,7 @@ class MCTSEngine:
                     node = child
             
             # === Simulation ===
-            reward = self._simulate(node)
+            reward, sampled_mapping = self._simulate(node)
             
             # === Backpropagation ===
             self._backpropagate(node, reward)
@@ -609,19 +815,28 @@ class MCTSEngine:
             # === Early Stopping ===
             if reward > best_fidelity:
                 best_fidelity = reward
+                best_mapping = sampled_mapping
                 no_improve_count = 0
             else:
                 no_improve_count += 1
             
             if no_improve_count >= patience:
-                print(f"  [MCTS] Early stop at iteration {actual_iterations}/{max_iterations} "
-                      f"(no improvement for {patience} rounds)")
+                if os.environ.get("DASATOM_VERBOSE_MCTS", "0") == "1":
+                    print(
+                        f"  [MCTS] Early stop at iteration {actual_iterations}/{max_iterations} "
+                        f"(no improvement for {patience} rounds)"
+                    )
                 break
         
         if no_improve_count < patience:
-            print(f"  [MCTS] Completed all {actual_iterations} iterations")
+            if os.environ.get("DASATOM_VERBOSE_MCTS", "0") == "1":
+                print(f"  [MCTS] Completed all {actual_iterations} iterations")
         
-        # 返回访问次数最多的路径对应的映射
+        # 优先返回搜索过程中观测到的最高奖励映射。
+        if best_mapping is not None:
+            return best_mapping
+
+        # 回退：返回访问次数最多的路径对应的映射。
         return self._extract_best_mapping(root)
     
     def _extract_best_mapping(self, root: MCTSNode) -> dict:
@@ -646,8 +861,8 @@ class MCTSEngine:
             return self._greedy_complete_mapping(
                 node.mapping, node.unmapped_qubits
             )
-        
-        return node.mapping
+
+        return self._greedy_complete_mapping(node.mapping, [])
 
 
 def mcts_initial_mapping(dag, architecture_graph: nx.Graph, 
