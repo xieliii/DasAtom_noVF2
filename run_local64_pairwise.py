@@ -102,8 +102,8 @@ def main() -> int:
     logs_current = bundle / "logs_current"
     logs_baseline = bundle / "logs_baseline"
     driver_log = bundle / "local64_driver.log"
-    current_out_root = cur / ".tmp_local48_current"
-    baseline_out_root = base / ".tmp_local48_baseline"
+    current_out_root = cur / ".tmp_local64_current"
+    baseline_out_root = base / ".tmp_local64_baseline"
 
     if not list_path.exists():
         raise FileNotFoundError(f"Missing benchmark list: {list_path}")
