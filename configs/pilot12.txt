@@ -1,0 +1,12 @@
+3_regular_10.qasm
+qv_16.qasm
+qft_16.qasm
+random_16.qasm
+star_16.qasm
+rd84_142.qasm
+qft_24.qasm
+qv_24.qasm
+random_24.qasm
+3_regular_40.qasm
+qft_40.qasm
+cm42a_207.qasm

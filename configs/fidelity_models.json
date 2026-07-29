@@ -1,0 +1,18 @@
+{
+  "schema_version": "forceshuttle_fidelity_sensitivity_v1",
+  "defaults": {
+    "cz_fidelity": 0.995,
+    "cz_duration_us": 0.2,
+    "transfer_fidelity": 0.9981,
+    "transfer_duration_us": 20.0,
+    "coherence_time_us": 1500000.0,
+    "move_speed_um_per_us": 0.55
+  },
+  "sensitivity": {
+    "transfer_fidelity": [0.995, 0.9981, 0.9995, 1.0],
+    "transfer_duration_us": [10.0, 20.0, 40.0],
+    "coherence_time_us": [500000.0, 1500000.0, 3000000.0],
+    "move_speed_um_per_us": [0.3, 0.55, 1.0],
+    "transfer_semantics": ["batch", "per_atom"]
+  }
+}

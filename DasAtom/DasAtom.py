@@ -825,7 +825,7 @@ class DasAtom:
 
         # Optionally append global parameters at the bottom
         # 可选：在底部附加全局参数
-        params_dict = set_parameters(True)
+        params_dict = set_parameters()
         param_log_row = []
         for key, val in params_dict.items():
             param_log_row.append(str(key))

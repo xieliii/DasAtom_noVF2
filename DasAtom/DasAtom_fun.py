@@ -57,9 +57,15 @@ def CreateCircuitFromQASM(file, path):
     cir = qasm2.load(filePath, custom_instructions=custom)
     gates_in_circuit = {op[0].name for op in cir.data}
     allowed_basis_gates = {'cz', 'h', 's', 't', 'rx', 'ry', 'rz'}
+    ordered_basis_gates = ('cz', 'h', 's', 't', 'rx', 'ry', 'rz')
     # Check if there are any disallowed gates by checking the difference between sets
     if gates_in_circuit - allowed_basis_gates:
-        cir = transpile(cir, basis_gates=list(allowed_basis_gates),optimization_level=0)
+        cir = transpile(
+            cir,
+            basis_gates=ordered_basis_gates,
+            optimization_level=0,
+            seed_transpiler=int(os.environ.get('DASATOM_SEED', '0')),
+        )
     return cir
 
 
@@ -734,6 +740,22 @@ def _split_valid_violating_gates(gates, embedding, rb):
         else:
             valid.append(gate)
     return violating, valid
+
+
+def _split_dependency_closed_executable_gates(gates, embedding, rb):
+    """Keep only Rb-valid gates whose per-qubit predecessors were not deferred."""
+
+    executable = []
+    deferred = []
+    blocked_qubits = set()
+    for gate in gates:
+        u, v = gate[0], gate[1]
+        if _gate_violates_rb(gate, embedding, rb) or u in blocked_qubits or v in blocked_qubits:
+            deferred.append(gate)
+            blocked_qubits.update((u, v))
+        else:
+            executable.append(gate)
+    return executable, deferred
 
 
 def _build_strict_single_gate_embedding(prev_mapping, gate, all_nodes, rb, num_q):
@@ -1546,19 +1568,23 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
             next_embedding = _normalize_mapping(next_embedding)
             violating, valid = _split_valid_violating_gates(gates, next_embedding, Rb)
             if (not fast_ok) and dense_small_quick_split and violating and len(violating) <= max(3, len(gates) // 8):
-                partition_gates[i] = valid
-                partition_gates.insert(i + 1, violating)
-                embeddings.append(next_embedding)
-                prev_mapping = next_embedding
-                i += 1
-                continue
+                executable, deferred = _split_dependency_closed_executable_gates(gates, next_embedding, Rb)
+                if executable:
+                    partition_gates[i] = executable
+                    partition_gates.insert(i + 1, deferred)
+                    embeddings.append(next_embedding)
+                    prev_mapping = next_embedding
+                    i += 1
+                    continue
             if (not fast_ok) and dense_repair_preferred and valid and len(valid) >= int(0.75 * len(gates)):
-                partition_gates[i] = valid
-                partition_gates.insert(i + 1, violating)
-                embeddings.append(next_embedding)
-                prev_mapping = next_embedding
-                i += 1
-                continue
+                executable, deferred = _split_dependency_closed_executable_gates(gates, next_embedding, Rb)
+                if executable:
+                    partition_gates[i] = executable
+                    partition_gates.insert(i + 1, deferred)
+                    embeddings.append(next_embedding)
+                    prev_mapping = next_embedding
+                    i += 1
+                    continue
             if not fast_ok:
                 next_embedding = force_directed_mapping(
                     gates,
@@ -1601,8 +1627,14 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                 continue
 
             if violating:
-                partition_gates[i] = valid
-                partition_gates.insert(i + 1, violating)
+                executable, deferred = _split_dependency_closed_executable_gates(gates, next_embedding, Rb)
+                if not executable:
+                    split_at = max(1, len(gates) // 2)
+                    partition_gates[i] = list(gates[:split_at])
+                    partition_gates.insert(i + 1, list(gates[split_at:]))
+                    continue
+                partition_gates[i] = executable
+                partition_gates.insert(i + 1, deferred)
 
             embeddings.append(next_embedding)
             prev_mapping = next_embedding
@@ -1888,8 +1920,14 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
             continue
 
         if violating:
-            partition_gates[i] = valid
-            partition_gates.insert(i + 1, violating)
+            executable, deferred = _split_dependency_closed_executable_gates(gates, next_embedding, Rb)
+            if not executable:
+                split_at = max(1, len(gates) // 2)
+                partition_gates[i] = list(gates[:split_at])
+                partition_gates.insert(i + 1, list(gates[split_at:]))
+                continue
+            partition_gates[i] = executable
+            partition_gates.insert(i + 1, deferred)
 
         embeddings.append(next_embedding)
         prev_mapping = next_embedding

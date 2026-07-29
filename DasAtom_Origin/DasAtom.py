@@ -486,7 +486,7 @@ class DasAtom:
             self.master_sheet.append(row_data)
 
         # Optionally append global parameters at the bottom
-        params_dict = set_parameters(True)
+        params_dict = set_parameters()
         param_log_row = []
         for key, val in params_dict.items():
             param_log_row.append(str(key))

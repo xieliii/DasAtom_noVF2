@@ -1,0 +1,26 @@
+* text=auto
+
+*.py text eol=lf
+*.ps1 text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# These canonical inputs are byte-frozen CRLF files. Their SHA256 values are
+# part of the experiment provenance and must not be line-ending normalized.
+benchmarks/local64/*.qasm -text whitespace=cr-at-eol
+configs/local64.txt -text !eol whitespace=cr-at-eol
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.xlsx binary
+*.xls binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary

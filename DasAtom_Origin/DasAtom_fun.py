@@ -23,9 +23,15 @@ def CreateCircuitFromQASM(file, path):
     cir = qasm2.load(filePath, custom_instructions=custom)
     gates_in_circuit = {op[0].name for op in cir.data}
     allowed_basis_gates = {'cz', 'h', 's', 't', 'rx', 'ry', 'rz'}
+    ordered_basis_gates = ('cz', 'h', 's', 't', 'rx', 'ry', 'rz')
     # Check if there are any disallowed gates by checking the difference between sets
     if gates_in_circuit - allowed_basis_gates:
-        cir = transpile(cir, basis_gates=list(allowed_basis_gates),optimization_level=0)
+        cir = transpile(
+            cir,
+            basis_gates=ordered_basis_gates,
+            optimization_level=0,
+            seed_transpiler=int(os.environ.get('DASATOM_SEED', '0')),
+        )
     return cir
 
 

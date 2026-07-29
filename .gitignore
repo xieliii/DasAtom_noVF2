@@ -13,6 +13,7 @@ build/
 venv/
 env/
 .venv/
+.venv-*/
 
 # IDE
 .idea/
@@ -37,3 +38,18 @@ Thumbs.db
 DasAtom/res/
 *.prof
 out.csv
+
+# Canonical rerun outputs and local archives
+results/
+runs/
+archives/
+*.zip.sha256
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environment captures
+environment.json
+requirements.resolved.txt
