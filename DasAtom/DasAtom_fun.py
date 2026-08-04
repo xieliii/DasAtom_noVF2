@@ -917,6 +917,8 @@ def _min_conflicts_embedding(
     previous = _complete_injective_mapping(prev_mapping, num_q, nodes, prev_mapping)
     previous_indices = [node_index[position] for position in previous]
     rng = random.Random(int(seed))
+    rng_random = rng.random
+    rng_randrange = rng.randrange
     quantization_scale = 100_000_000.0
     quantized_excess_cache = {}
     quantized_move_cache = {}
@@ -1002,17 +1004,21 @@ def _min_conflicts_embedding(
 
             worst = max(bad_counts)
             movable = [q for q, count in enumerate(bad_counts) if count == worst]
-            q = movable[rng.randrange(len(movable))]
+            q = movable[rng_randrange(len(movable))]
 
             choices = []
+            choices_append = choices.append
             old_position = mapping[q]
+            incident_q = incident[q]
+            affected_by_swap_q = affected_by_swap[q]
+            previous_distance_row = distance_matrix[previous_indices[q]]
             for destination in range(len(nodes)):
-                if destination == mapping[q]:
+                if destination == old_position:
                     continue
                 q2 = occupant[destination]
                 if q2 < 0:
                     q2 = None
-                affected = incident[q] if q2 is None else affected_by_swap[q][q2]
+                affected = incident_q if q2 is None else affected_by_swap_q[q2]
 
                 new_violations = 0
                 new_excess = 0.0
@@ -1027,7 +1033,7 @@ def _min_conflicts_embedding(
                     new_excess += excess
                     old_violations += edge_violations[edge_index]
                     old_excess += edge_excess[edge_index]
-                move_cost = distance_matrix[previous_indices[q]][destination]
+                move_cost = previous_distance_row[destination]
                 if q2 is not None:
                     move_cost += distance_matrix[previous_indices[q2]][old_position]
 
@@ -1043,12 +1049,12 @@ def _min_conflicts_embedding(
                 except KeyError:
                     move_cost_key = round(move_cost * quantization_scale)
                     quantized_move_cache[move_cost] = move_cost_key
-                choices.append(
+                choices_append(
                     (
                         candidate_violations,
                         candidate_excess_key,
                         move_cost_key,
-                        rng.random(),
+                        rng_random(),
                         destination,
                         q2,
                         candidate_excess,
@@ -1061,13 +1067,13 @@ def _min_conflicts_embedding(
             if choice_cost >= current:
                 stagnant += 1
                 if stagnant % 23 == 0:
-                    choice = choices[rng.randrange(min(8, len(choices)))]
+                    choice = choices[rng_randrange(min(8, len(choices)))]
                     choice_cost = (choice[0], choice[6])
             else:
                 stagnant = 0
 
             _, _, _, _, destination, q2, _ = choice
-            affected = incident[q] if q2 is None else affected_by_swap[q][q2]
+            affected = incident_q if q2 is None else affected_by_swap_q[q2]
             if q2 is None:
                 occupant[old_position] = -1
                 mapping[q] = destination
