@@ -1,7 +1,6 @@
 import os
 import time
 import math
-from openpyxl import Workbook
 import warnings
 from collections import Counter
 from Enola.route import QuantumRouter
@@ -221,6 +220,8 @@ class SingleFileProcessor:
             f'{self.qasm_filename}_rb{self.interaction_radius:.3g}.xlsx'
         )
         if self.save_circuit_results:
+            from openpyxl import Workbook
+
             wb = Workbook()
             ws = wb.active
             for item in self.file_process_log:
@@ -772,6 +773,8 @@ class DasAtom:
 
         # Create a master Excel workbook for the entire benchmark
         # 为整个基准测试创建一个主 Excel 工作簿
+        from openpyxl import Workbook
+
         self.master_workbook = Workbook()
         self.master_sheet = self.master_workbook.active
         self.master_sheet.append([
