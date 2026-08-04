@@ -758,6 +758,411 @@ def _split_dependency_closed_executable_gates(gates, embedding, rb):
     return executable, deferred
 
 
+def _complete_injective_mapping(mapping, num_q, all_nodes, prev_mapping=None):
+    """Normalize a partial mapping without changing already valid assignments."""
+
+    nodes = [tuple(node) for node in all_nodes]
+    result = [-1] * num_q
+    used = set()
+    for q in range(min(num_q, len(mapping))):
+        pos = mapping[q]
+        if pos == -1:
+            continue
+        pos = tuple(pos)
+        if pos not in nodes or pos in used:
+            continue
+        result[q] = pos
+        used.add(pos)
+
+    available = [node for node in nodes if node not in used]
+    previous = prev_mapping if prev_mapping is not None else mapping
+    for q in range(num_q):
+        if result[q] != -1:
+            continue
+        prev = None
+        if q < len(previous) and previous[q] != -1:
+            candidate = tuple(previous[q])
+            if candidate in available:
+                prev = candidate
+        if prev is not None:
+            result[q] = prev
+            available.remove(prev)
+            continue
+        if not available:
+            raise RuntimeError("No physical node remains while completing an embedding.")
+        target = None
+        if q < len(previous) and previous[q] != -1:
+            target = tuple(previous[q])
+        if target is None:
+            result[q] = available.pop(0)
+        else:
+            index = min(range(len(available)), key=lambda j: euclidean_distance(target, available[j]))
+            result[q] = available.pop(index)
+    return result
+
+
+def _degree_central_seed(gates, prev_mapping, all_nodes, num_q, rb):
+    """Build a deterministic no-VF2 seed using logical and physical degree."""
+
+    nodes = [tuple(node) for node in all_nodes]
+    logical = nx.Graph()
+    logical.add_nodes_from(range(num_q))
+    logical.add_edges_from((int(gate[0]), int(gate[1])) for gate in gates)
+    rb_neighbors = _get_cached_rb_neighbors(nodes, rb)
+    center = (
+        sum(node[0] for node in nodes) / max(1, len(nodes)),
+        sum(node[1] for node in nodes) / max(1, len(nodes)),
+    )
+    qubit_order = sorted(
+        range(num_q),
+        key=lambda q: (logical.degree(q), -q),
+        reverse=True,
+    )
+    physical_order = sorted(
+        nodes,
+        key=lambda node: (
+            -len(rb_neighbors[node]),
+            euclidean_distance(node, center),
+            node,
+        ),
+    )
+    result = [-1] * num_q
+    available = list(physical_order)
+    for q in qubit_order:
+        prev = None if prev_mapping[q] == -1 else tuple(prev_mapping[q])
+        logical_neighbors = [nb for nb in logical.neighbors(q) if result[nb] != -1]
+
+        def key(node):
+            violations = sum(
+                euclidean_distance(node, tuple(result[nb])) > rb + 1e-9
+                for nb in logical_neighbors
+            )
+            excess = sum(
+                max(0.0, euclidean_distance(node, tuple(result[nb])) - rb)
+                for nb in logical_neighbors
+            )
+            move = 0.0 if prev is None else euclidean_distance(prev, node)
+            return violations, round(excess, 8), round(move, 8), physical_order.index(node)
+
+        chosen = min(available, key=key)
+        result[q] = chosen
+        available.remove(chosen)
+    return result
+
+
+def _min_conflicts_embedding(
+    gates,
+    prev_mapping,
+    all_nodes,
+    rb,
+    num_q,
+    future_gates=None,
+    seed_mappings=None,
+    seed=0,
+    restarts=6,
+    max_steps=1000,
+    max_valid_candidates=3,
+):
+    """Find an injective Rb-valid embedding using deterministic local search.
+
+    This is a permutation min-conflicts solver.  It never calls VF2.  The hard
+    objective is the number and excess of Rb violations; movement and future
+    pressure only break ties between valid candidates.
+    """
+
+    unique_edges = sorted({tuple(sorted((int(gate[0]), int(gate[1])))) for gate in gates})
+    if not unique_edges:
+        return _complete_injective_mapping(prev_mapping, num_q, all_nodes, prev_mapping)
+
+    nodes = [tuple(node) for node in all_nodes]
+    node_index = {node: index for index, node in enumerate(nodes)}
+    distance_matrix = [
+        [euclidean_distance(source, destination) for destination in nodes]
+        for source in nodes
+    ]
+    excess_matrix = [
+        [max(0.0, distance - rb) for distance in row]
+        for row in distance_matrix
+    ]
+    incident = [[] for _ in range(num_q)]
+    for edge_index, (u, v) in enumerate(unique_edges):
+        incident[u].append(edge_index)
+        incident[v].append(edge_index)
+
+    previous = _complete_injective_mapping(prev_mapping, num_q, nodes, prev_mapping)
+    previous_indices = [node_index[position] for position in previous]
+    rng = random.Random(int(seed))
+
+    initial_mappings = []
+    seen_initial = set()
+
+    def push_initial(mapping):
+        completed = _complete_injective_mapping(mapping, num_q, nodes, previous)
+        signature = tuple(completed)
+        if signature in seen_initial:
+            return
+        seen_initial.add(signature)
+        initial_mappings.append([node_index[position] for position in completed])
+
+    push_initial(previous)
+    for mapping in seed_mappings or []:
+        push_initial(mapping)
+    push_initial(_degree_central_seed(gates, previous, nodes, num_q, rb))
+
+    while len(initial_mappings) < restarts:
+        shuffled = list(range(len(nodes)))
+        rng.shuffle(shuffled)
+        signature = tuple(nodes[index] for index in shuffled[:num_q])
+        if signature in seen_initial:
+            continue
+        seen_initial.add(signature)
+        initial_mappings.append(shuffled[:num_q])
+
+    def valid_key(mapping_indices):
+        mapping = [nodes[index] for index in mapping_indices]
+        refined = _local_refine_valid_embedding(
+            gates,
+            mapping,
+            previous,
+            nodes,
+            rb,
+            future_gates=future_gates,
+            max_rounds=12,
+            fidelity_priority=True,
+        )
+        return _embedding_objective_key(
+            refined,
+            previous,
+            future_gates,
+            rb,
+            fidelity_priority=True,
+        ), refined
+
+    valid_candidates = []
+    for initial in initial_mappings[:restarts]:
+        mapping = list(initial)
+        occupant = [-1] * len(nodes)
+        for q, position_index in enumerate(mapping):
+            occupant[position_index] = q
+
+        edge_violations = [0] * len(unique_edges)
+        edge_excess = [0.0] * len(unique_edges)
+        bad_counts = [0] * num_q
+        total_violations = 0
+        total_excess = 0.0
+        for edge_index, (u, v) in enumerate(unique_edges):
+            excess = excess_matrix[mapping[u]][mapping[v]]
+            violation = 1 if excess > 1e-9 else 0
+            edge_violations[edge_index] = violation
+            edge_excess[edge_index] = excess
+            total_violations += violation
+            total_excess += excess
+            if violation:
+                bad_counts[u] += 1
+                bad_counts[v] += 1
+        current = (total_violations, total_excess)
+
+        stagnant = 0
+        for _ in range(max_steps):
+            if current[0] == 0:
+                key, refined = valid_key(mapping)
+                signature = tuple(refined)
+                if all(signature != item[1] for item in valid_candidates):
+                    valid_candidates.append((key, signature, refined))
+                    valid_candidates.sort(key=lambda item: item[0])
+                break
+
+            worst = max(bad_counts)
+            movable = [q for q, count in enumerate(bad_counts) if count == worst]
+            q = movable[rng.randrange(len(movable))]
+
+            choices = []
+            old_position = mapping[q]
+            for destination in range(len(nodes)):
+                if destination == mapping[q]:
+                    continue
+                q2 = occupant[destination]
+                if q2 < 0:
+                    q2 = None
+                affected = set(incident[q])
+                if q2 is not None:
+                    affected.update(incident[q2])
+
+                new_violations = 0
+                new_excess = 0.0
+                for edge_index in affected:
+                    u, v = unique_edges[edge_index]
+                    pos_u = destination if u == q else old_position if q2 is not None and u == q2 else mapping[u]
+                    pos_v = destination if v == q else old_position if q2 is not None and v == q2 else mapping[v]
+                    excess = excess_matrix[pos_u][pos_v]
+                    new_violations += 1 if excess > 1e-9 else 0
+                    new_excess += excess
+
+                old_violations = sum(edge_violations[edge_index] for edge_index in affected)
+                old_excess = sum(edge_excess[edge_index] for edge_index in affected)
+                move_cost = distance_matrix[previous_indices[q]][destination]
+                if q2 is not None:
+                    move_cost += distance_matrix[previous_indices[q2]][old_position]
+
+                candidate = (
+                    current[0] - old_violations + new_violations,
+                    current[1] - old_excess + new_excess,
+                )
+                choices.append((candidate, round(move_cost, 8), rng.random(), destination, q2))
+
+            choices.sort(key=lambda item: (item[0][0], round(item[0][1], 8), item[1], item[2]))
+            choice = choices[0]
+            if choice[0] >= current:
+                stagnant += 1
+                if stagnant % 23 == 0:
+                    choice = choices[rng.randrange(min(8, len(choices)))]
+            else:
+                stagnant = 0
+
+            next_cost, _, _, destination, q2 = choice
+            affected = set(incident[q])
+            if q2 is not None:
+                affected.update(incident[q2])
+            if q2 is None:
+                occupant[old_position] = -1
+                mapping[q] = destination
+                occupant[destination] = q
+            else:
+                mapping[q], mapping[q2] = mapping[q2], mapping[q]
+                occupant[mapping[q]] = q
+                occupant[mapping[q2]] = q2
+
+            for edge_index in affected:
+                u, v = unique_edges[edge_index]
+                old_violation = edge_violations[edge_index]
+                excess = excess_matrix[mapping[u]][mapping[v]]
+                new_violation = 1 if excess > 1e-9 else 0
+                if old_violation != new_violation:
+                    delta = 1 if new_violation else -1
+                    bad_counts[u] += delta
+                    bad_counts[v] += delta
+                edge_violations[edge_index] = new_violation
+                edge_excess[edge_index] = excess
+            current = next_cost
+
+        if len(valid_candidates) >= max_valid_candidates:
+            break
+
+    if not valid_candidates:
+        return None
+    valid_candidates.sort(key=lambda item: item[0])
+    return list(valid_candidates[0][2])
+
+
+def _dependency_layers(gates):
+    """Re-layer a source-ordered gate list without changing per-qubit order."""
+
+    if not gates:
+        return []
+    _, dag = gates_list_to_QC(gates)
+    return get_layer_gates(dag)
+
+
+def _prefix_search_upper_bound(layers):
+    """Estimate a useful no-VF2 layer prefix before local-search feasibility.
+
+    Circuits with mostly unique interactions become geometrically difficult at
+    a lower average degree than circuits that repeat the same interaction.  The
+    bound is deliberately conservative: a smaller valid partition is cheaper
+    than repeatedly proving that an obviously dense prefix is not embeddable.
+    """
+
+    graph = nx.Graph()
+    gate_count = 0
+    best = 1
+    for layer_index, layer in enumerate(layers, start=1):
+        graph.add_edges_from((int(gate[0]), int(gate[1])) for gate in layer)
+        gate_count += len(layer)
+        node_count = graph.number_of_nodes()
+        if node_count == 0:
+            best = layer_index
+            continue
+        unique_edges = graph.number_of_edges()
+        average_degree = (2.0 * unique_edges) / node_count
+        reuse_ratio = unique_edges / max(1, gate_count)
+        max_degree = max((degree for _, degree in graph.degree()), default=0)
+        average_cap = 3.75 if reuse_ratio >= 0.78 else 4.5
+        if average_degree <= average_cap + 1e-9 and max_degree <= 8:
+            best = layer_index
+            continue
+        break
+    return min(max(1, best), len(layers))
+
+
+def _find_dependency_safe_prefix_embedding(
+    gates,
+    prev_mapping,
+    all_nodes,
+    rb,
+    num_q,
+    future_gates=None,
+    seed_mappings=None,
+    seed=0,
+):
+    """Find the largest dependency-layer prefix embeddable without VF2."""
+
+    layers = _dependency_layers(gates)
+    if not layers:
+        return None
+
+    cache = {}
+
+    def try_prefix(layer_count, effort_scale=1):
+        if layer_count in cache:
+            return cache[layer_count]
+        prefix = sum(layers[:layer_count], [])
+        mapping = _min_conflicts_embedding(
+            prefix,
+            prev_mapping,
+            all_nodes,
+            rb,
+            num_q,
+            future_gates=future_gates,
+            seed_mappings=seed_mappings,
+            seed=int(seed) + layer_count * 1009,
+            restarts=min(10, 4 + effort_scale * 2),
+            max_steps=min(2400, 700 + effort_scale * 350),
+            max_valid_candidates=2,
+        )
+        cache[layer_count] = (prefix, mapping)
+        return cache[layer_count]
+
+    upper_bound = _prefix_search_upper_bound(layers)
+    best = None
+
+    # The structural bound is normally within one layer of the useful limit.
+    # Descending avoids the expensive full-prefix failures that dominated QFT.
+    for layer_count in range(upper_bound, max(0, upper_bound - 4), -1):
+        prefix, mapping = try_prefix(layer_count)
+        if mapping is not None:
+            best = (layer_count, prefix, mapping)
+            break
+
+    if best is None:
+        low = 1
+        high = max(1, upper_bound - 4)
+        while low <= high:
+            middle = (low + high) // 2
+            prefix, mapping = try_prefix(middle, effort_scale=2 if middle == 1 else 1)
+            if mapping is not None:
+                best = (middle, prefix, mapping)
+                low = middle + 1
+            else:
+                high = middle - 1
+
+    if best is None:
+        return None
+
+    layer_count, prefix, mapping = best
+    deferred = sum(layers[layer_count:], [])
+    return prefix, deferred, mapping
+
+
 def _build_strict_single_gate_embedding(prev_mapping, gate, all_nodes, rb, num_q):
     u, v = gate[0], gate[1]
     all_nodes = [tuple(node) for node in all_nodes]
@@ -1902,6 +2307,35 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                     violating, valid = _split_valid_violating_gates(gates, next_embedding, Rb)
                     if not violating or valid:
                         break
+
+        if violating and len(gates) > 1:
+            executable_now, _ = _split_dependency_closed_executable_gates(gates, next_embedding, Rb)
+            prefix_result = _find_dependency_safe_prefix_embedding(
+                gates,
+                prev_mapping,
+                all_nodes,
+                Rb,
+                num_q,
+                future_gates=future,
+                seed_mappings=[next_embedding, *unique_candidates],
+                seed=(i + 1) * 10007 + num_q * 101 + len(gates),
+            )
+            if prefix_result is not None:
+                prefix_gates, deferred_gates, prefix_embedding = prefix_result
+                prefix_violating, _ = _split_valid_violating_gates(prefix_gates, prefix_embedding, Rb)
+                if not prefix_violating and (
+                    not deferred_gates or len(prefix_gates) > len(executable_now)
+                ):
+                    partition_gates[i] = prefix_gates
+                    if deferred_gates:
+                        if i + 1 < len(partition_gates):
+                            partition_gates[i + 1] = deferred_gates + partition_gates[i + 1]
+                        else:
+                            partition_gates.insert(i + 1, deferred_gates)
+                    embeddings.append(prefix_embedding)
+                    prev_mapping = prefix_embedding
+                    i += 1
+                    continue
 
         if violating and not valid:
             if len(gates) == 1:
