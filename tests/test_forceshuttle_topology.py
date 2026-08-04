@@ -122,5 +122,6 @@ def test_prefix_search_budget_preserves_repeated_interaction_effort() -> None:
     unique = [[0, 1], [1, 2], [2, 3], [3, 4]]
     repeated = [[0, 1], [1, 2], [0, 1], [1, 2]]
 
-    assert module._prefix_search_step_budget(unique, 1) == 420
-    assert module._prefix_search_step_budget(repeated, 1) == 1050
+    assert module._prefix_search_step_budget(unique, 1) == 1050
+    assert module._prefix_search_step_budget(unique, 1, allow_fast_failure=True) == 420
+    assert module._prefix_search_step_budget(repeated, 1, allow_fast_failure=True) == 1050

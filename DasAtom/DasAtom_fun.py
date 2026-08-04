@@ -1106,14 +1106,14 @@ def _prefix_search_upper_bound(layers):
     return min(max(1, best), len(layers))
 
 
-def _prefix_search_step_budget(prefix, effort_scale):
+def _prefix_search_step_budget(prefix, effort_scale, allow_fast_failure=False):
     """Use full search effort for repeated interactions, fast failure otherwise."""
 
     unique_edge_count = len(
         {tuple(sorted((int(gate[0]), int(gate[1])))) for gate in prefix}
     )
     repeated_interaction_ratio = len(prefix) / max(1, unique_edge_count)
-    if repeated_interaction_ratio >= 1.5:
+    if (not allow_fast_failure) or repeated_interaction_ratio >= 1.5:
         return min(2400, 700 + effort_scale * 350)
     return min(1200, 280 + effort_scale * 140)
 
@@ -1127,6 +1127,7 @@ def _find_dependency_safe_prefix_embedding(
     future_gates=None,
     seed_mappings=None,
     seed=0,
+    allow_fast_failure=False,
 ):
     """Find the largest dependency-layer prefix embeddable without VF2."""
 
@@ -1140,7 +1141,11 @@ def _find_dependency_safe_prefix_embedding(
         if layer_count in cache:
             return cache[layer_count]
         prefix = sum(layers[:layer_count], [])
-        step_budget = _prefix_search_step_budget(prefix, effort_scale)
+        step_budget = _prefix_search_step_budget(
+            prefix,
+            effort_scale,
+            allow_fast_failure=allow_fast_failure,
+        )
         mapping = _min_conflicts_embedding(
             prefix,
             prev_mapping,
@@ -1901,6 +1906,8 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
     prev_mapping = [(-1 if pos == -1 else tuple(pos)) for pos in initial_mapping]
     embeddings = []
     micro_fast_mode = num_q <= 12
+    initial_two_qubit_gate_count = sum(len(partition) for partition in partition_gates)
+    allow_fast_prefix_failure = num_q >= 30 and initial_two_qubit_gate_count <= 500
     disable_first_partition_refine = (
         os.environ.get("DASATOM_DISABLE_FIRST_PARTITION_REFINEMENT", "0") == "1"
     )
@@ -2015,6 +2022,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                     future_gates=future,
                     seed_mappings=[next_embedding],
                     seed=(i + 1) * 10007 + num_q * 101 + len(gates),
+                    allow_fast_failure=allow_fast_prefix_failure,
                 )
                 if prefix_result is not None:
                     prefix_gates, deferred_gates, prefix_embedding = prefix_result
@@ -2382,6 +2390,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                 future_gates=future,
                 seed_mappings=[next_embedding, *unique_candidates],
                 seed=(i + 1) * 10007 + num_q * 101 + len(gates),
+                allow_fast_failure=allow_fast_prefix_failure,
             )
             if prefix_result is not None:
                 prefix_gates, deferred_gates, prefix_embedding = prefix_result
