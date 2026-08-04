@@ -917,6 +917,9 @@ def _min_conflicts_embedding(
     previous = _complete_injective_mapping(prev_mapping, num_q, nodes, prev_mapping)
     previous_indices = [node_index[position] for position in previous]
     rng = random.Random(int(seed))
+    quantization_scale = 100_000_000.0
+    quantized_excess_cache = {}
+    quantized_move_cache = {}
 
     initial_mappings = []
     seen_initial = set()
@@ -1030,11 +1033,21 @@ def _min_conflicts_embedding(
 
                 candidate_violations = current[0] - old_violations + new_violations
                 candidate_excess = current[1] - old_excess + new_excess
+                try:
+                    candidate_excess_key = quantized_excess_cache[candidate_excess]
+                except KeyError:
+                    candidate_excess_key = round(candidate_excess * quantization_scale)
+                    quantized_excess_cache[candidate_excess] = candidate_excess_key
+                try:
+                    move_cost_key = quantized_move_cache[move_cost]
+                except KeyError:
+                    move_cost_key = round(move_cost * quantization_scale)
+                    quantized_move_cache[move_cost] = move_cost_key
                 choices.append(
                     (
                         candidate_violations,
-                        int(round(candidate_excess * 100_000_000.0)),
-                        int(round(move_cost * 100_000_000.0)),
+                        candidate_excess_key,
+                        move_cost_key,
                         rng.random(),
                         destination,
                         q2,
