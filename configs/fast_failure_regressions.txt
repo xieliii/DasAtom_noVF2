@@ -1,0 +1,6 @@
+3_regular_30.qasm
+qv_30.qasm
+random_30.qasm
+3_regular_40.qasm
+3_regular_50.qasm
+random_40.qasm
