@@ -108,8 +108,6 @@ class SingleFileProcessor:
         :return: A list of metrics to be appended as a row in the main (benchmark-wide) workbook.
         :return: 一个指标列表，将作为一行附加到主（全基准测试）工作簿中。
         """
-        wb = Workbook()
-        ws = wb.active
         start_time = time.time()
 
         # 1) Create circuit from QASM, extract gate statistics and 2-qubit DAG
@@ -222,9 +220,11 @@ class SingleFileProcessor:
             self.result_path,
             f'{self.qasm_filename}_rb{self.interaction_radius:.3g}.xlsx'
         )
-        for item in self.file_process_log:
-            ws.append([str(v) if not isinstance(v, (int, float, str)) else v for v in item])
         if self.save_circuit_results:
+            wb = Workbook()
+            ws = wb.active
+            for item in self.file_process_log:
+                ws.append([str(v) if not isinstance(v, (int, float, str)) else v for v in item])
             wb.save(save_file_name)
 
         # 10) Return the row of aggregated stats for the main (benchmark-wide) workbook
