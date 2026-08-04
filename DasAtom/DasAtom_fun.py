@@ -1013,8 +1013,8 @@ def _min_conflicts_embedding(
                 choices.append(
                     (
                         candidate_violations,
-                        round(candidate_excess, 8),
-                        round(move_cost, 8),
+                        int(round(candidate_excess * 100_000_000.0)),
+                        int(round(move_cost * 100_000_000.0)),
                         rng.random(),
                         destination,
                         q2,
