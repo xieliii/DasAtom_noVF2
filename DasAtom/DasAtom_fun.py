@@ -1106,6 +1106,18 @@ def _prefix_search_upper_bound(layers):
     return min(max(1, best), len(layers))
 
 
+def _prefix_search_step_budget(prefix, effort_scale):
+    """Use full search effort for repeated interactions, fast failure otherwise."""
+
+    unique_edge_count = len(
+        {tuple(sorted((int(gate[0]), int(gate[1])))) for gate in prefix}
+    )
+    repeated_interaction_ratio = len(prefix) / max(1, unique_edge_count)
+    if repeated_interaction_ratio >= 1.5:
+        return min(2400, 700 + effort_scale * 350)
+    return min(1200, 280 + effort_scale * 140)
+
+
 def _find_dependency_safe_prefix_embedding(
     gates,
     prev_mapping,
@@ -1128,6 +1140,7 @@ def _find_dependency_safe_prefix_embedding(
         if layer_count in cache:
             return cache[layer_count]
         prefix = sum(layers[:layer_count], [])
+        step_budget = _prefix_search_step_budget(prefix, effort_scale)
         mapping = _min_conflicts_embedding(
             prefix,
             prev_mapping,
@@ -1138,7 +1151,7 @@ def _find_dependency_safe_prefix_embedding(
             seed_mappings=seed_mappings,
             seed=int(seed) + layer_count * 1009,
             restarts=min(10, 4 + effort_scale * 2),
-            max_steps=min(2400, 700 + effort_scale * 350),
+            max_steps=step_budget,
             max_valid_candidates=2,
         )
         cache[layer_count] = (prefix, mapping)

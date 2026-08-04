@@ -115,3 +115,12 @@ def test_small_circuit_prefix_search_is_no_vf2_and_valid(monkeypatch) -> None:
     prefix, _, mapping = result
     assert prefix
     assert all(not module._gate_violates_rb(gate, mapping, 2.0) for gate in prefix)
+
+
+def test_prefix_search_budget_preserves_repeated_interaction_effort() -> None:
+    module = _load_forceshuttle_functions()
+    unique = [[0, 1], [1, 2], [2, 3], [3, 4]]
+    repeated = [[0, 1], [1, 2], [0, 1], [1, 2]]
+
+    assert module._prefix_search_step_budget(unique, 1) == 420
+    assert module._prefix_search_step_budget(repeated, 1) == 1050
