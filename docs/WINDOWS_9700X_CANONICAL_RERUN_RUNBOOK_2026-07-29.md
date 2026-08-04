@@ -1,10 +1,10 @@
 # ForceShuttle Windows 9700X Canonical Rerun Runbook
 
-更新时间：2026-07-29
+更新时间：2026-08-04
 
 适用对象：家中 Windows 实验机上的 Codex
 
-目标分支：`canonical-rerun-2026-07-29`
+目标分支：`fidelity-optimization-2026-08-04`
 
 正式代码 commit：由 Mac 端最终交接消息单独提供的 40 位 Git SHA
 
@@ -63,6 +63,13 @@ Q-Tetris
 
 Enola 和 Atomique 完全 out of scope。不要寻找它们的旧目录，不要修改它们的旧状态，也不要把它们混入新 summary。
 
+当前目标分支已经包含两类经过 Mac 端完整 64 电路验证的 ForceShuttle 修改：
+
+1. 用确定性的无 VF2 dependency-prefix local search 减少不必要分区与 transfer。
+2. 对 min-conflicts 候选代价采用等价的增量计算与交换边缓存，在不改变分区、transfer、距离或 fidelity 指标的前提下减少运行时间。
+
+这些修改不允许 Windows 端继续调整。Windows 任务只是从冻结 commit 做同机 ForceShuttle/DasAtom 最终测量。
+
 仓库中的两套实现仍会 import 各自目录下的 `Enola/route.py`。这里的 `route.py` 只是 ForceShuttle 和 DasAtom 内部复用的 endpoint movement batching helper。看到该文件被 import 或执行不表示运行了 Enola compiler baseline，不要删除、替换或禁用这个 helper。Atomique 在本轮代码路径中完全不涉及。
 
 ## 2. 本次能够证明和不能证明什么
@@ -106,7 +113,7 @@ git@github.com:xieliii/DasAtom_noVF2.git
 权威分支：
 
 ```text
-canonical-rerun-2026-07-29
+fidelity-optimization-2026-08-04
 ```
 
 权威 commit 不直接写死在这份受 Git 跟踪的文件中，而是由 Mac 端在代码完成、测试通过并推送后，通过最终交接消息单独提供一个 40 位 Git SHA。原因是 commit 不能在同一次提交中包含它自身的最终 SHA；把 SHA 再写回本文件会产生另一个 commit，并使原 SHA 失效。
@@ -114,7 +121,7 @@ canonical-rerun-2026-07-29
 Windows Codex 在开始前必须同时拿到：
 
 ```text
-branch = canonical-rerun-2026-07-29
+branch = fidelity-optimization-2026-08-04
 commit = Mac 端最终交接消息中的 40 位 SHA
 ```
 
@@ -186,7 +193,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $RepoUrl = "git@github.com:xieliii/DasAtom_noVF2.git"
-$Branch = "canonical-rerun-2026-07-29"
+$Branch = "fidelity-optimization-2026-08-04"
 $ExpectedCommit = "<粘贴 Mac 端最终交接消息中的 40 位 commit SHA>"
 $WorkRoot = "D:\ForceShuttleCanonical"
 
