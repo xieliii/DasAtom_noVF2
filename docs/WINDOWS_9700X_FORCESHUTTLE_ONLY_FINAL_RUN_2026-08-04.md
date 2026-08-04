@@ -130,6 +130,10 @@ New-Item -ItemType Directory -Force -Path $Preflight | Out-Null
 & $Python scripts\capture_environment.py --output (Join-Path $Preflight "environment.json")
 if ($LASTEXITCODE -ne 0) { throw "Environment capture failed." }
 
+& $Python -m pip freeze --all |
+    Set-Content -LiteralPath (Join-Path $Preflight "requirements.resolved.txt") -Encoding UTF8
+if ($LASTEXITCODE -ne 0) { throw "pip freeze failed." }
+
 Get-CimInstance Win32_Processor |
     Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed |
     ConvertTo-Json -Depth 4 |
