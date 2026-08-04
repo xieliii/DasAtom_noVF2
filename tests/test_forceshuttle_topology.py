@@ -85,3 +85,33 @@ def test_dependency_layer_prefix_preserves_each_qubit_order() -> None:
         source = [gate for gate in gates if qubit in gate]
         scheduled = [gate for gate in flattened if qubit in gate]
         assert scheduled == source
+
+
+def test_small_circuit_prefix_search_is_no_vf2_and_valid(monkeypatch) -> None:
+    module = _load_forceshuttle_functions()
+
+    def forbidden_vf2(*args, **kwargs):
+        raise AssertionError("small-circuit noVF2 prefix search must not call VF2")
+
+    monkeypatch.setattr(module, "rx_is_subgraph_iso", forbidden_vf2)
+    nodes = sorted(module.generate_grid_with_Rb(3, 3, 2.0).nodes())
+    previous = nodes[:9]
+    gates = [
+        [0, 1], [2, 3], [4, 5], [6, 7],
+        [1, 2], [3, 4], [5, 6], [7, 8],
+        [0, 8], [1, 7], [2, 6], [3, 5],
+    ]
+
+    result = module._find_dependency_safe_prefix_embedding(
+        gates,
+        previous,
+        nodes,
+        2.0,
+        9,
+        seed=17,
+    )
+
+    assert result is not None
+    prefix, _, mapping = result
+    assert prefix
+    assert all(not module._gate_violates_rb(gate, mapping, 2.0) for gate in prefix)

@@ -1972,6 +1972,44 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
             )
             next_embedding = _normalize_mapping(next_embedding)
             violating, valid = _split_valid_violating_gates(gates, next_embedding, Rb)
+
+            # Small circuits are cheap enough for the deterministic no-VF2
+            # prefix solver. Use it before the legacy quick-split heuristics:
+            # repeated binary/executable-only splits create many unnecessary
+            # transfers on dense 7-12 qubit circuits.
+            if (not fast_ok) and violating and len(gates) > 1:
+                executable_now, _ = _split_dependency_closed_executable_gates(
+                    gates, next_embedding, Rb
+                )
+                prefix_result = _find_dependency_safe_prefix_embedding(
+                    gates,
+                    prev_mapping,
+                    all_nodes,
+                    Rb,
+                    num_q,
+                    future_gates=future,
+                    seed_mappings=[next_embedding],
+                    seed=(i + 1) * 10007 + num_q * 101 + len(gates),
+                )
+                if prefix_result is not None:
+                    prefix_gates, deferred_gates, prefix_embedding = prefix_result
+                    prefix_violating, _ = _split_valid_violating_gates(
+                        prefix_gates, prefix_embedding, Rb
+                    )
+                    if not prefix_violating and (
+                        not deferred_gates or len(prefix_gates) > len(executable_now)
+                    ):
+                        partition_gates[i] = prefix_gates
+                        if deferred_gates:
+                            if i + 1 < len(partition_gates):
+                                partition_gates[i + 1] = deferred_gates + partition_gates[i + 1]
+                            else:
+                                partition_gates.insert(i + 1, deferred_gates)
+                        embeddings.append(prefix_embedding)
+                        prev_mapping = prefix_embedding
+                        i += 1
+                        continue
+
             if (not fast_ok) and dense_small_quick_split and violating and len(violating) <= max(3, len(gates) // 8):
                 executable, deferred = _split_dependency_closed_executable_gates(gates, next_embedding, Rb)
                 if executable:
