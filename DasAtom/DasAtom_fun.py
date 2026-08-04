@@ -888,6 +888,11 @@ def _min_conflicts_embedding(
     for edge_index, (u, v) in enumerate(unique_edges):
         incident[u].append(edge_index)
         incident[v].append(edge_index)
+    incident_sets = [set(edges) for edges in incident]
+    affected_by_swap = [
+        [tuple(sorted(incident_sets[q].union(incident_sets[q2]))) for q2 in range(num_q)]
+        for q in range(num_q)
+    ]
 
     previous = _complete_injective_mapping(prev_mapping, num_q, nodes, prev_mapping)
     previous_indices = [node_index[position] for position in previous]
@@ -984,12 +989,12 @@ def _min_conflicts_embedding(
                 q2 = occupant[destination]
                 if q2 < 0:
                     q2 = None
-                affected = set(incident[q])
-                if q2 is not None:
-                    affected.update(incident[q2])
+                affected = incident[q] if q2 is None else affected_by_swap[q][q2]
 
                 new_violations = 0
                 new_excess = 0.0
+                old_violations = 0
+                old_excess = 0.0
                 for edge_index in affected:
                     u, v = unique_edges[edge_index]
                     pos_u = destination if u == q else old_position if q2 is not None and u == q2 else mapping[u]
@@ -997,32 +1002,39 @@ def _min_conflicts_embedding(
                     excess = excess_matrix[pos_u][pos_v]
                     new_violations += 1 if excess > 1e-9 else 0
                     new_excess += excess
-
-                old_violations = sum(edge_violations[edge_index] for edge_index in affected)
-                old_excess = sum(edge_excess[edge_index] for edge_index in affected)
+                    old_violations += edge_violations[edge_index]
+                    old_excess += edge_excess[edge_index]
                 move_cost = distance_matrix[previous_indices[q]][destination]
                 if q2 is not None:
                     move_cost += distance_matrix[previous_indices[q2]][old_position]
 
-                candidate = (
-                    current[0] - old_violations + new_violations,
-                    current[1] - old_excess + new_excess,
+                candidate_violations = current[0] - old_violations + new_violations
+                candidate_excess = current[1] - old_excess + new_excess
+                choices.append(
+                    (
+                        candidate_violations,
+                        round(candidate_excess, 8),
+                        round(move_cost, 8),
+                        rng.random(),
+                        destination,
+                        q2,
+                        candidate_excess,
+                    )
                 )
-                choices.append((candidate, round(move_cost, 8), rng.random(), destination, q2))
 
-            choices.sort(key=lambda item: (item[0][0], round(item[0][1], 8), item[1], item[2]))
+            choices.sort()
             choice = choices[0]
-            if choice[0] >= current:
+            choice_cost = (choice[0], choice[6])
+            if choice_cost >= current:
                 stagnant += 1
                 if stagnant % 23 == 0:
                     choice = choices[rng.randrange(min(8, len(choices)))]
+                    choice_cost = (choice[0], choice[6])
             else:
                 stagnant = 0
 
-            next_cost, _, _, destination, q2 = choice
-            affected = set(incident[q])
-            if q2 is not None:
-                affected.update(incident[q2])
+            _, _, _, _, destination, q2, _ = choice
+            affected = incident[q] if q2 is None else affected_by_swap[q][q2]
             if q2 is None:
                 occupant[old_position] = -1
                 mapping[q] = destination
@@ -1043,7 +1055,7 @@ def _min_conflicts_embedding(
                     bad_counts[v] += delta
                 edge_violations[edge_index] = new_violation
                 edge_excess[edge_index] = excess
-            current = next_cost
+            current = choice_cost
 
         if len(valid_candidates) >= max_valid_candidates:
             break
