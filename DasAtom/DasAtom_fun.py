@@ -19,6 +19,7 @@ custom = [
 
 _RB_NEIGHBOR_CACHE = {}
 _EUCLIDEAN_CACHE = {}
+_EMBEDDING_GEOMETRY_CACHE = {}
 
 
 def _get_cached_rb_neighbors(all_nodes, rb, eps=1e-9):
@@ -447,6 +448,31 @@ def euclidean_distance(node1, node2):
     _EUCLIDEAN_CACHE[key] = dist
     return dist
 
+
+def _get_cached_embedding_geometry(all_nodes, rb):
+    nodes_key = tuple(tuple(node) for node in all_nodes)
+    key = (float(rb), nodes_key)
+    cached = _EMBEDDING_GEOMETRY_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if len(_EMBEDDING_GEOMETRY_CACHE) > 32:
+        _EMBEDDING_GEOMETRY_CACHE.clear()
+
+    nodes = list(nodes_key)
+    node_index = {node: index for index, node in enumerate(nodes)}
+    distance_matrix = [
+        [euclidean_distance(source, destination) for destination in nodes]
+        for source in nodes
+    ]
+    excess_matrix = [
+        [max(0.0, distance - rb) for distance in row]
+        for row in distance_matrix
+    ]
+    cached = (nodes, node_index, distance_matrix, excess_matrix)
+    _EMBEDDING_GEOMETRY_CACHE[key] = cached
+    return cached
+
 def generate_grid_with_Rb(n, m, Rb):
     G = nx.grid_2d_graph(n, m)  # 生成n*m的网格图
     for node1 in G.nodes():
@@ -874,16 +900,10 @@ def _min_conflicts_embedding(
     if not unique_edges:
         return _complete_injective_mapping(prev_mapping, num_q, all_nodes, prev_mapping)
 
-    nodes = [tuple(node) for node in all_nodes]
-    node_index = {node: index for index, node in enumerate(nodes)}
-    distance_matrix = [
-        [euclidean_distance(source, destination) for destination in nodes]
-        for source in nodes
-    ]
-    excess_matrix = [
-        [max(0.0, distance - rb) for distance in row]
-        for row in distance_matrix
-    ]
+    nodes, node_index, distance_matrix, excess_matrix = _get_cached_embedding_geometry(
+        all_nodes,
+        rb,
+    )
     incident = [[] for _ in range(num_q)]
     for edge_index, (u, v) in enumerate(unique_edges):
         incident[u].append(edge_index)
