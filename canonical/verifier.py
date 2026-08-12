@@ -117,9 +117,20 @@ def verify_compiler_output(
             )
         if scope.get("one_qubit_policy") != "counted_not_scheduled":
             audit.error("one_qubit_scope", "1Q policy must be counted_not_scheduled.", "scope.one_qubit_policy")
-        method = payload.get("method", {}).get("id")
-        if method not in {"forceshuttle", "dasatom"}:
+        method_record = payload.get("method", {})
+        method = method_record.get("id")
+        expected_modes = {
+            "forceshuttle": "full",
+            "fs_no_mcts": "no_mcts",
+            "fs_no_force": "no_force",
+            "fs_no_lookahead": "no_lookahead",
+            "dasatom": None,
+        }
+        if method not in expected_modes:
             audit.error("method", f"Unknown method {method!r}.", "method.id")
+        expected_mode = expected_modes.get(method)
+        if "ablation_mode" in method_record and method_record.get("ablation_mode") != expected_mode:
+            audit.error("ablation_mode", "Method ID and ablation mode disagree.", "method.ablation_mode")
         return {"method": method}
 
     audit.run("schema_scope", check_schema)
@@ -149,6 +160,40 @@ def verify_compiler_output(
         return {"external_source_checked": True, "qasm_sha256": parsed["qasm_sha256"]}
 
     audit.run("qasm_source", check_qasm)
+
+    def check_ablation_diagnostics() -> dict[str, Any]:
+        method = payload.get("method", {}).get("id")
+        if method == "dasatom" or "ablation_mode" not in payload.get("method", {}):
+            return {"checked": False}
+        diagnostics = payload.get("compiler", {}).get("ablation_diagnostics")
+        if not isinstance(diagnostics, dict):
+            audit.error("ablation_diagnostics", "Missing ablation diagnostics.", "compiler.ablation_diagnostics")
+            return {"checked": False}
+        required = {
+            "ablation_mode", "mcts_call_count", "mcts_time_seconds",
+            "force_directed_call_count", "force_directed_time_seconds",
+            "future_lookahead_enabled", "future_lookahead_query_count",
+            "repair_call_count", "static_embedding_attempt_count",
+            "prefix_search_count", "split_count", "extension_count",
+        }
+        missing = sorted(required - diagnostics.keys())
+        if missing:
+            audit.error("ablation_diagnostics", f"Missing diagnostics: {missing}.", "compiler.ablation_diagnostics")
+        mode = payload.get("method", {}).get("ablation_mode")
+        if diagnostics.get("ablation_mode") != mode:
+            audit.error("ablation_diagnostics", "Diagnostics mode disagrees with method.", "compiler.ablation_diagnostics.ablation_mode")
+        if mode == "no_mcts" and diagnostics.get("mcts_call_count") != 0:
+            audit.error("ablation_diagnostics", "no_mcts called MCTS.", "compiler.ablation_diagnostics.mcts_call_count")
+        if mode == "no_force" and diagnostics.get("force_directed_call_count") != 0:
+            audit.error("ablation_diagnostics", "no_force called force-directed mapping.", "compiler.ablation_diagnostics.force_directed_call_count")
+        if mode == "no_lookahead" and (
+            diagnostics.get("future_lookahead_enabled") is not False
+            or diagnostics.get("future_lookahead_query_count") != 0
+        ):
+            audit.error("ablation_diagnostics", "no_lookahead queried future gates.", "compiler.ablation_diagnostics")
+        return {"checked": True, "mode": mode}
+
+    audit.run("ablation_diagnostics", check_ablation_diagnostics)
 
     source_by_id: dict[str, dict[str, Any]] = {}
     source_order: list[str] = []

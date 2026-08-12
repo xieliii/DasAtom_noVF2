@@ -28,6 +28,7 @@ class _MethodSpec:
     implementation_directory: str
     engine: str | None
     algorithm_files: tuple[str, ...]
+    ablation_mode: str | None = None
 
 
 _METHODS = {
@@ -42,6 +43,28 @@ _METHODS = {
             "analytical_placer.py",
             "Enola/route.py",
         ),
+        ablation_mode="full",
+    ),
+    "fs_no_mcts": _MethodSpec(
+        method_id="fs_no_mcts",
+        implementation_directory="DasAtom",
+        engine="noVF2",
+        algorithm_files=("DasAtom.py", "DasAtom_fun.py", "mcts_mapper.py", "analytical_placer.py", "Enola/route.py"),
+        ablation_mode="no_mcts",
+    ),
+    "fs_no_force": _MethodSpec(
+        method_id="fs_no_force",
+        implementation_directory="DasAtom",
+        engine="noVF2",
+        algorithm_files=("DasAtom.py", "DasAtom_fun.py", "mcts_mapper.py", "analytical_placer.py", "Enola/route.py"),
+        ablation_mode="no_force",
+    ),
+    "fs_no_lookahead": _MethodSpec(
+        method_id="fs_no_lookahead",
+        implementation_directory="DasAtom",
+        engine="noVF2",
+        algorithm_files=("DasAtom.py", "DasAtom_fun.py", "mcts_mapper.py", "analytical_placer.py", "Enola/route.py"),
+        ablation_mode="no_lookahead",
     ),
     "dasatom": _MethodSpec(
         method_id="dasatom",
@@ -420,6 +443,8 @@ def compile_single_qasm(
             }
             if spec.engine is not None:
                 kwargs["engine"] = spec.engine
+            if spec.ablation_mode is not None:
+                kwargs["ablation_mode"] = spec.ablation_mode
             processor = processor_class(**kwargs)
             row = processor.process_qasm_file()
 
@@ -455,6 +480,7 @@ def compile_single_qasm(
             "implementation_directory": spec.implementation_directory,
             "engine": spec.engine,
             "algorithm_file_sha256": _algorithm_hashes(root, spec),
+            "ablation_mode": spec.ablation_mode,
         },
         "input": {"filename": qasm.name, "qasm_sha256": circuit.qasm_sha256},
         "config": {
@@ -473,6 +499,7 @@ def compile_single_qasm(
             "parallel_groups": parallel_groups,
             "movement_transitions": movement_transitions,
             "legacy_metrics": _legacy_metrics(row, state.legacy_fidelity_result),
+            "ablation_diagnostics": module.get_ablation_diagnostics() if spec.ablation_mode is not None else {},
         },
     }
     payload["metrics"] = compute_metrics(payload)

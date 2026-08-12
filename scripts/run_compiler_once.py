@@ -14,6 +14,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from canonical import atomic_write_json, compile_single_qasm  # noqa: E402
+from _common import SUPPORTED_METHODS  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,7 +24,7 @@ def parse_args() -> argparse.Namespace:
             "or the original DasAtom implementation."
         )
     )
-    parser.add_argument("--method", required=True, choices=("forceshuttle", "dasatom"))
+    parser.add_argument("--method", required=True, choices=SUPPORTED_METHODS)
     parser.add_argument("--qasm", required=True, type=Path, help="Exact QASM file; no recursive lookup is performed.")
     parser.add_argument(
         "--output",

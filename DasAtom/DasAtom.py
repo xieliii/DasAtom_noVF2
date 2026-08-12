@@ -40,7 +40,8 @@ class SingleFileProcessor:
         save_partitions_and_embeddings: bool,
         save_circuit_results: bool,
         save_benchmark_results: bool,
-        engine: str = 'dual'
+        engine: str = 'dual',
+        ablation_mode: str = 'full'
     ):
         """
         Initialize the processor with file-specific and benchmark-wide parameters.
@@ -84,6 +85,10 @@ class SingleFileProcessor:
         self.save_circuit_results = save_circuit_results
         self.save_benchmark_results = save_benchmark_results
         self.engine = engine
+        if ablation_mode not in ABLATION_MODES:
+            raise ValueError(f"ablation_mode must be one of {ABLATION_MODES}, got {ablation_mode!r}")
+        self.ablation_mode = ablation_mode
+        configure_ablation(ablation_mode)
 
         # Used to store logs for the final XLSX per file
         # 用于存储每个文件最终 XLSX 的日志
@@ -508,25 +513,45 @@ class SingleFileProcessor:
                         f"  [MCTS] Adaptive iterations: {adaptive_iterations} "
                         f"(qubits={num_qubits}, first_partition_gates={first_partition_size})"
                     )
-                mcts_start = time.time()
-                mcts_dict = mcts_initial_mapping(
-                    dag_object,
-                    coupling_graph,
-                    grid_size,
-                    interaction_radius=self.interaction_radius,
-                    max_iterations=adaptive_iterations
-                )
-                mcts_time = time.time() - mcts_start
+                if self.ablation_mode == 'no_mcts':
+                    mcts_dict = None
+                    mcts_time = 0.0
+                    init_map_list = get_initial_mapping_no_vf2(
+                        partitioned_gates[0] if partitioned_gates else [],
+                        coupling_graph,
+                        num_qubits,
+                        self.interaction_radius,
+                    )
+                    if init_map_list is None:
+                        init_map_list = complete_injective_mapping(
+                            [-1] * num_qubits, num_qubits, list(coupling_graph.nodes()), None
+                        )
+                    self.file_process_log.append(["Initial mapping method", "no_vf2_deterministic"])
+                else:
+                    mcts_start = time.perf_counter()
+                    record_ablation_event("mcts_call_count")
+                    mcts_dict = mcts_initial_mapping(
+                        dag_object,
+                        coupling_graph,
+                        grid_size,
+                        interaction_radius=self.interaction_radius,
+                        max_iterations=adaptive_iterations
+                    )
+                    mcts_time = time.perf_counter() - mcts_start
+                    record_ablation_event("mcts_time_seconds", mcts_time)
                 if verbose_init:
-                    print(f"  [MCTS] Done in {mcts_time:.2f}s, mapped {len(mcts_dict)} qubits")
-                self.file_process_log.append(["Initial mapping method", "mcts_primary"])
+                    mapped_count = len(mcts_dict) if mcts_dict is not None else len(init_map_list)
+                    print(f"  [MCTS] Done in {mcts_time:.2f}s, mapped {mapped_count} qubits")
+                if mcts_dict is not None:
+                    self.file_process_log.append(["Initial mapping method", "mcts_primary"])
                 self.file_process_log.append(["MCTS search time", mcts_time])
 
                 # 格式转换：MCTS 字典 {logic_qubit: (x,y)} -> 列表格式
-                init_map_list = [-1] * num_qubits
-                for q, pos in mcts_dict.items():
-                    if q < num_qubits:
-                        init_map_list[q] = pos
+                if mcts_dict is not None:
+                    init_map_list = [-1] * num_qubits
+                    for q, pos in mcts_dict.items():
+                        if q < num_qubits:
+                            init_map_list[q] = pos
                 embeddings, extended_positions = get_embeddings(
                     partitioned_gates,
                     coupling_graph,

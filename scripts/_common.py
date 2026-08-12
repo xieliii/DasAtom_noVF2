@@ -27,7 +27,10 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 SCHEMA_VERSION = "canonical-rerun-v1"
-METHODS = ("forceshuttle", "dasatom")
+DEFAULT_METHODS = ("forceshuttle", "dasatom")
+ABLATION_METHODS = ("fs_no_mcts", "fs_no_force", "fs_no_lookahead")
+METHODS = DEFAULT_METHODS
+SUPPORTED_METHODS = DEFAULT_METHODS + ABLATION_METHODS
 METHOD_PROVENANCE_SPECS = {
     "forceshuttle": {
         "implementation_directory": "DasAtom",
@@ -39,6 +42,25 @@ METHOD_PROVENANCE_SPECS = {
             "analytical_placer.py",
             "Enola/route.py",
         ),
+        "ablation_mode": "full",
+    },
+    "fs_no_mcts": {
+        "implementation_directory": "DasAtom",
+        "engine": "noVF2",
+        "ablation_mode": "no_mcts",
+        "algorithm_files": ("DasAtom.py", "DasAtom_fun.py", "mcts_mapper.py", "analytical_placer.py", "Enola/route.py"),
+    },
+    "fs_no_force": {
+        "implementation_directory": "DasAtom",
+        "engine": "noVF2",
+        "ablation_mode": "no_force",
+        "algorithm_files": ("DasAtom.py", "DasAtom_fun.py", "mcts_mapper.py", "analytical_placer.py", "Enola/route.py"),
+    },
+    "fs_no_lookahead": {
+        "implementation_directory": "DasAtom",
+        "engine": "noVF2",
+        "ablation_mode": "no_lookahead",
+        "algorithm_files": ("DasAtom.py", "DasAtom_fun.py", "mcts_mapper.py", "analytical_placer.py", "Enola/route.py"),
     },
     "dasatom": {
         "implementation_directory": "DasAtom_Origin",
@@ -131,12 +153,15 @@ def normalize_methods(values: Sequence[str]) -> list[str]:
         "forceshuttle": "forceshuttle",
         "das": "dasatom",
         "dasatom": "dasatom",
+        "fs_no_mcts": "fs_no_mcts",
+        "fs_no_force": "fs_no_force",
+        "fs_no_lookahead": "fs_no_lookahead",
     }
     result: list[str] = []
     for value in values:
         key = value.strip().lower()
         if key not in aliases:
-            raise ValueError(f"unknown method {value!r}; choose from {', '.join(METHODS)}")
+            raise ValueError(f"unknown method {value!r}; choose from {', '.join(SUPPORTED_METHODS)}")
         normalized = aliases[key]
         if normalized not in result:
             result.append(normalized)
@@ -266,6 +291,7 @@ def method_provenance_from_snapshot(method: str, snapshot: Mapping[str, Any]) ->
         "id": method,
         "implementation_directory": implementation,
         "engine": spec["engine"],
+        "ablation_mode": spec.get("ablation_mode"),
         "algorithm_file_sha256": algorithm_hashes,
     }
 

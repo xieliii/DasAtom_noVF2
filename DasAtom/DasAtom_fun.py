@@ -2,6 +2,67 @@ import rustworkx as rx
 import networkx as nx
 import numpy as np
 import random
+import time
+
+ABLATION_MODES = ("full", "no_mcts", "no_force", "no_lookahead")
+_ABLATION_MODE = "full"
+_ABLATION_DIAGNOSTICS = {}
+
+
+def configure_ablation(mode="full"):
+    global _ABLATION_MODE, _ABLATION_DIAGNOSTICS
+    mode = str(mode).strip().lower()
+    if mode not in ABLATION_MODES:
+        raise ValueError(f"ablation_mode must be one of {ABLATION_MODES}, got {mode!r}")
+    _ABLATION_MODE = mode
+    _ABLATION_DIAGNOSTICS = {
+        "ablation_mode": mode,
+        "mcts_call_count": 0,
+        "mcts_time_seconds": 0.0,
+        "force_directed_call_count": 0,
+        "force_directed_time_seconds": 0.0,
+        "future_lookahead_enabled": mode != "no_lookahead",
+        "future_lookahead_query_count": 0,
+        "repair_call_count": 0,
+        "static_embedding_attempt_count": 0,
+        "prefix_search_count": 0,
+        "split_count": 0,
+        "extension_count": 0,
+    }
+
+
+def get_ablation_diagnostics():
+    return dict(_ABLATION_DIAGNOSTICS)
+
+
+def complete_injective_mapping(mapping, num_q, all_nodes, previous=None):
+    return _complete_injective_mapping(mapping, num_q, all_nodes, previous)
+
+
+def record_ablation_event(name, value=1):
+    if name in _ABLATION_DIAGNOSTICS:
+        _ABLATION_DIAGNOSTICS[name] += value
+
+
+def _force_directed_candidate(gates, prev_mapping, all_nodes, rb, num_q, future_gates=None):
+    """Route force-directed candidates through the explicit ablation switch."""
+    if _ABLATION_MODE == "no_force":
+        candidate = _min_conflicts_embedding(
+            gates, prev_mapping, all_nodes, rb, num_q,
+            future_gates=future_gates,
+            seed=len(gates) * 1009 + num_q * 17,
+            restarts=4,
+            max_steps=1200,
+        )
+        return candidate if candidate is not None else list(prev_mapping)
+    from analytical_placer import force_directed_mapping
+    start = time.perf_counter()
+    result = force_directed_mapping(
+        gates, prev_mapping, all_nodes, rb, num_q, future_gates=future_gates
+    )
+    record_ablation_event("force_directed_call_count")
+    record_ablation_event("force_directed_time_seconds", time.perf_counter() - start)
+    return result
 import math
 import os
 import re
@@ -1164,6 +1225,9 @@ def _find_dependency_safe_prefix_embedding(
 ):
     """Find the largest dependency-layer prefix embeddable without VF2."""
 
+    record_ablation_event("prefix_search_count")
+    if _ABLATION_MODE == "no_lookahead":
+        future_gates = None
     layers = _dependency_layers(gates)
     if not layers:
         return None
@@ -1301,6 +1365,8 @@ def _total_violation_metrics(gates, mapping, rb):
 
 
 def _collect_active_qubits(*gate_groups):
+    if _ABLATION_MODE == "no_lookahead" and len(gate_groups) > 1:
+        gate_groups = gate_groups[:1]
     active = set()
     for group in gate_groups:
         if not group:
@@ -1543,6 +1609,11 @@ def _movement_aware_repair(gates, mapping, prev_mapping, all_nodes, rb, future_g
     Local greedy repair that minimizes Rb violations while keeping movement small.
     No VF2 is used.
     """
+    record_ablation_event("repair_call_count")
+    if _ABLATION_MODE == "no_lookahead":
+        future_gates = None
+    elif future_gates:
+        record_ablation_event("future_lookahead_query_count")
     eps = 1e-9
     all_nodes = [tuple(node) for node in all_nodes]
     current = [tuple(pos) for pos in mapping]
@@ -1727,6 +1798,7 @@ def _try_static_embedding(partition_gates, coupling_graph, num_q, rb, prev_mappi
     Try to find one static embedding that satisfies all 2Q interactions.
     Backtracking CSP (no VF2). Returns mapping list or None.
     """
+    record_ablation_event("static_embedding_attempt_count")
     logic_graph = nx.Graph()
     for layer in partition_gates:
         logic_graph.add_edges_from(layer)
@@ -1934,6 +2006,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
 
     all_nodes = [tuple(node) for node in coupling_graph.nodes()]
     extend_position = []
+    original_partition_count = len(partition_gates)
     current_arch_size = arch_size
 
     prev_mapping = [(-1 if pos == -1 else tuple(pos)) for pos in initial_mapping]
@@ -1948,7 +2021,9 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
     i = 0
     while i < len(partition_gates):
         gates = partition_gates[i]
-        future = partition_gates[i + 1:i + 4]
+        future = None if _ABLATION_MODE == "no_lookahead" else partition_gates[i + 1:i + 4]
+        if future:
+            record_ablation_event("future_lookahead_query_count")
         if not gates:
             embeddings.append(list(prev_mapping))
             i += 1
@@ -1993,7 +2068,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                 i += 1
                 continue
             active_qubits = _collect_active_qubits(gates, future)
-            fd_seed = force_directed_mapping(
+            fd_seed = _force_directed_candidate(
                 gates,
                 prev_mapping,
                 all_nodes,
@@ -2095,7 +2170,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                     i += 1
                     continue
             if not fast_ok:
-                next_embedding = force_directed_mapping(
+                next_embedding = _force_directed_candidate(
                     gates,
                     prev_mapping,
                     all_nodes,
@@ -2204,7 +2279,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
 
         if need_force_search and len(candidate_embeddings) < max_candidates:
             active_qubits = _collect_active_qubits(gates, future) if (not speed_guard) else None
-            fd_embedding = force_directed_mapping(
+            fd_embedding = _force_directed_candidate(
                 gates,
                 prev_mapping,
                 all_nodes,
@@ -2240,7 +2315,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                 and len(candidate_embeddings) < max_candidates
                 and (len(gates) <= 35 or num_q <= 12 or (fidelity_priority and len(gates) <= 80))
             ):
-                fd_now_embedding = force_directed_mapping(
+                fd_now_embedding = _force_directed_candidate(
                     gates,
                     prev_mapping,
                     all_nodes,
@@ -2274,7 +2349,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                     shuffled_gates = list(gates)
                     rng = random.Random(seed)
                     rng.shuffle(shuffled_gates)
-                    fd_shuffle_embedding = force_directed_mapping(
+                    fd_shuffle_embedding = _force_directed_candidate(
                         shuffled_gates,
                         prev_mapping,
                         all_nodes,
@@ -2376,7 +2451,7 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                 extend_position.append(i)
 
                 active_qubits = _collect_active_qubits(gates, future)
-                ext_embedding = force_directed_mapping(
+                ext_embedding = _force_directed_candidate(
                     gates,
                     prev_mapping,
                     all_nodes,
@@ -2493,6 +2568,10 @@ def get_embeddings(partition_gates, coupling_graph, num_q, arch_size, Rb, initia
                 if _gate_violates_rb(gate, emb, Rb):
                     raise RuntimeError(f"Rb violation at partition {part_idx}, gate={gate}.")
 
+    if len(partition_gates) > original_partition_count:
+        record_ablation_event("split_count", len(partition_gates) - original_partition_count)
+    if extend_position:
+        record_ablation_event("extension_count", len(extend_position))
     return embeddings, extend_position
 
 def qasm_to_map(filename):

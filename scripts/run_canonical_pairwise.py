@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from _common import (
+    DEFAULT_METHODS,
     METHODS,
+    SUPPORTED_METHODS,
     REPO_ROOT,
     SCHEMA_VERSION,
     RunLock,
@@ -60,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", type=Path, default=REPO_ROOT / "results" / "canonical-run")
     parser.add_argument("--benchmark-dir", type=Path, default=REPO_ROOT / "benchmarks" / "local64")
     parser.add_argument("--list", dest="list_path", type=Path, default=REPO_ROOT / "configs" / "local64.txt")
-    parser.add_argument("--methods", nargs="+", default=list(METHODS))
+    parser.add_argument("--methods", nargs="+", default=list(DEFAULT_METHODS))
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--timeout-sec", type=float, default=10800.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -89,14 +91,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.repeat_threshold_sec is not None:
         if args.repeat_threshold_sec <= 0:
             raise ValueError("--repeat-threshold-sec must be positive")
-        if set(args.methods) != set(METHODS):
+        if set(args.methods) != set(DEFAULT_METHODS):
             raise ValueError("--repeat-threshold-sec requires both forceshuttle and dasatom")
 
 
 def method_order(circuit_index: int, repetition: int, methods: Sequence[str]) -> list[str]:
-    ordered = [method for method in METHODS if method in methods]
-    if (circuit_index + repetition) % 2:
-        ordered.reverse()
+    ordered = [method for method in SUPPORTED_METHODS if method in methods]
+    offset = (circuit_index + repetition) % len(ordered)
+    ordered = ordered[offset:] + ordered[:offset]
     return ordered
 
 
@@ -628,7 +630,7 @@ def _mark_logical(
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     requested_methods = normalize_methods(args.methods)
-    args.methods = [method for method in METHODS if method in requested_methods]
+    args.methods = [method for method in SUPPORTED_METHODS if method in requested_methods]
     _validate_args(args)
     compiler_entry = REPO_ROOT / "scripts" / "run_compiler_once.py"
     if not compiler_entry.is_file():
